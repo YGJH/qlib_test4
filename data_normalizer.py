@@ -1,114 +1,123 @@
-
 #!/usr/bin/env python3
 """
-股票資料正規化腳本
-Stock Data Normalization Script for Machine Learning
-
-將股票CSV資料轉換成適合機器學習模型訓練的格式
+修復時間洩漏的強健版資料正規化腳本 - 考慮交易日曆
 """
 
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
-from sklearn.preprocessing import LabelEncoder
+from colors import *
+from sklearn.preprocessing import StandardScaler
 import warnings
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import pickle
 
 warnings.filterwarnings('ignore')
 
-class StockDataNormalizer:
-    """股票資料正規化器"""
+class TimeAwareStockDataNormalizer:
+    """時間感知的股票資料正規化器 - 避免look-ahead bias"""
     
-    def __init__(self, scaling_method='standard'):
-        """
-        初始化正規化器
-        
-        Args:
-            scaling_method: 正規化方法 ('standard', 'minmax', 'robust')
-        """
-        self.scaling_method = scaling_method
-        self.scalers = {}
-        self.feature_stats = {}
+    def __init__(self):
+        self.feature_scaler = StandardScaler()
+        self.target_scaler = StandardScaler()
         self.is_fitted = False
         
-        # 初始化scaler
-        if scaling_method == 'standard':
-            self.scaler = StandardScaler()
-        elif scaling_method == 'minmax':
-            self.scaler = MinMaxScaler()
-        elif scaling_method == 'robust':
-            self.scaler = RobustScaler()
-        else:
-            raise ValueError("scaling_method must be 'standard', 'minmax', or 'robust'")
+    def safe_division(self, numerator, denominator, fill_value=0.0):
+        """安全除法，避免除零和產生NaN"""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = numerator / denominator
+            result = np.where(np.isfinite(result), result, fill_value)
+            return result
     
-    def load_data(self, file_path):
-        """載入CSV資料"""
-        try:
-            df = pd.read_csv(file_path)
+    def clean_data(self, df):
+        """徹底清理數據中的異常值"""
+        df_clean = df.copy()
+        
+        # 1. 處理數值列的異常值
+        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+        
+        for col in numeric_cols:
+            # 替換無限值
+            df_clean[col] = np.where(np.isinf(df_clean[col]), np.nan, df_clean[col])
             
-            # 從檔案路徑提取股票代碼
-            stock_symbol = os.path.splitext(os.path.basename(file_path))[0]
-            df['stock_symbol'] = stock_symbol
+            # 處理極端異常值
+            if df_clean[col].notna().sum() > 0:
+                q_low = df_clean[col].quantile(0.001)
+                q_high = df_clean[col].quantile(0.999)
+                df_clean[col] = np.clip(df_clean[col], q_low, q_high)
+        
+        # 2. 填充NaN值
+        for col in numeric_cols:
+            if df_clean[col].isnull().sum() > 0:
+                median_val = df_clean[col].median()
+                if pd.isna(median_val):
+                    median_val = 0.0
+                df_clean[col] = df_clean[col].fillna(median_val)
+        
+        # 3. 最終檢查
+        remaining_nans = df_clean.isnull().sum().sum()
+        if remaining_nans > 0:
+            print_red(f"警告: 仍有 {remaining_nans} 個NaN值，將全部替換為0")
+            df_clean = df_clean.fillna(0.0)
+        
+        return df_clean
+    
+    def load_and_preprocess_data(self, data_dir='data/feature'):
+        """載入並預處理所有股票數據"""
+        all_data = []
+        csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+        print_green(f"發現 {len(csv_files)} 個CSV檔案")
+        
+        for i, csv_file in enumerate(csv_files):
+            print_yellow(f"處理文件 {i+1}/{len(csv_files)}: {csv_file}")
             
-            print(f"成功載入資料: {file_path}")
-            print(f"   股票代碼: {stock_symbol}")
-            print(f"   資料形狀: {df.shape}")
-            print(f"   時間範圍: {df['Datetime'].iloc[0]} 到 {df['Datetime'].iloc[-1]}")
-            return df
-        except Exception as e:
-            print(f"載入資料失敗: {str(e)}")
-            return None
+            file_path = os.path.join(data_dir, csv_file)
+            stock_symbol = os.path.splitext(csv_file)[0]
+            
+            try:
+                df = pd.read_csv(file_path)
+                df['stock_symbol'] = stock_symbol
+                df['Datetime'] = pd.to_datetime(df['Datetime'])
+                
+                # 清理數據
+                df = self.clean_data(df)
+                
+                # 基本特徵工程
+                df = self._create_robust_features(df)
+                
+                # 再次清理
+                df = self.clean_data(df)
+                
+                print_green(f"  ✓ 成功處理 {csv_file}, 形狀: {df.shape}")
+                all_data.append(df)
+                
+            except Exception as e:
+                print_red(f"  ✗ 處理 {csv_file} 時出錯: {e}")
+                continue
+        
+        if not all_data:
+            raise ValueError("沒有成功處理任何文件")
+        
+        combined_df = pd.concat(all_data, ignore_index=True)
+        combined_df = combined_df.sort_values(['stock_symbol', 'Datetime']).reset_index(drop=True)
+        
+        # 最終清理
+        combined_df = self.clean_data(combined_df)
+        
+        print_green(f"合併後數據形狀: {combined_df.shape}")
+        return combined_df
     
-    def analyze_data_quality(self, df):
-        """分析資料品質"""
-        print("\n資料品質分析:")
-        print("=" * 50)
-        
-        # 缺失值分析
-        missing_data = df.isnull().sum()
-        missing_pct = (missing_data / len(df)) * 100
-        
-        print("缺失值統計:")
-        for col in df.columns:
-            if missing_data[col] > 0:
-                print(f"   {col}: {missing_data[col]} ({missing_pct[col]:.2f}%)")
-        
-        # 資料類型
-        print(f"\n資料類型:")
-        for col in df.columns:
-            print(f"   {col}: {df[col].dtype}")
-        
-        # 基本統計
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        print(f"\n數值欄位統計 ({len(numeric_cols)} 個欄位):")
-        stats = df[numeric_cols].describe()
-        
-        return {
-            'missing_data': missing_data,
-            'missing_pct': missing_pct,
-            'stats': stats,
-            'numeric_cols': numeric_cols
-        }
-    
-    def preprocess_datetime(self, df):
-        """處理時間欄位"""
+    def _create_robust_features(self, df):
+        """創建強健的特徵，避免產生NaN"""
         df_processed = df.copy()
         
-        # 轉換時間格式
-        df_processed['Datetime'] = pd.to_datetime(df_processed['Datetime'])
-        
-        # 提取時間特徵
-        df_processed['Year'] = df_processed['Datetime'].dt.year
-        df_processed['Month'] = df_processed['Datetime'].dt.month
-        df_processed['Day'] = df_processed['Datetime'].dt.day
+        print_cyan("  創建時間特徵...")
+        # 時間特徵
         df_processed['Hour'] = df_processed['Datetime'].dt.hour
-        df_processed['Minute'] = df_processed['Datetime'].dt.minute
         df_processed['DayOfWeek'] = df_processed['Datetime'].dt.dayofweek
-        df_processed['DayOfYear'] = df_processed['Datetime'].dt.dayofyear
+        df_processed['Month'] = df_processed['Datetime'].dt.month
         
-        # 創建週期性特徵（正弦餘弦編碼）
+        # 週期性編碼
         df_processed['Hour_sin'] = np.sin(2 * np.pi * df_processed['Hour'] / 24)
         df_processed['Hour_cos'] = np.cos(2 * np.pi * df_processed['Hour'] / 24)
         df_processed['DayOfWeek_sin'] = np.sin(2 * np.pi * df_processed['DayOfWeek'] / 7)
@@ -116,389 +125,929 @@ class StockDataNormalizer:
         df_processed['Month_sin'] = np.sin(2 * np.pi * df_processed['Month'] / 12)
         df_processed['Month_cos'] = np.cos(2 * np.pi * df_processed['Month'] / 12)
         
-        print("時間特徵工程完成")
-        return df_processed
-    
-    def handle_missing_values(self, df):
-        """處理缺失值"""
-        df_processed = df.copy()
-        
-        # 對於技術指標，使用前向填充和後向填充
-        technical_indicators = ['MA5', 'MA10', 'MA20', 'RSI', 'MACD', 'MACD_Signal', 
-                               'MACD_Histogram', 'BB_Middle', 'BB_Upper', 'BB_Lower',
-                               'Volume_MA', 'Volume_Ratio', 'Volatility']
-        
-        for col in technical_indicators:
-            if col in df_processed.columns:
-                # 先前向填充，再後向填充
-                df_processed[col] = df_processed[col].fillna(method='ffill').fillna(method='bfill')
-                
-                # 如果還有缺失值，用該欄位的中位數填充
-                if df_processed[col].isnull().any():
-                    median_value = df_processed[col].median()
-                    df_processed[col].fillna(median_value, inplace=True)
-        
-        # 對於Price_Change_Pct，第一個值通常是NaN，設為0
-        if 'Price_Change_Pct' in df_processed.columns:
-            df_processed['Price_Change_Pct'].fillna(0, inplace=True)
-        
-        print("缺失值處理完成")
-        return df_processed
-    
-    def create_features(self, df):
-        """創建額外特徵"""
-        df_processed = df.copy()
-        
-        # 價格相關特徵
+        print_cyan("  創建價格特徵...")
+        # 價格特徵
         df_processed['Price_Range'] = df_processed['High'] - df_processed['Low']
-        df_processed['Price_Range_Pct'] = (df_processed['Price_Range'] / df_processed['Close']) * 100
-        df_processed['Open_Close_Ratio'] = df_processed['Open'] / df_processed['Close']
-        df_processed['High_Close_Ratio'] = df_processed['High'] / df_processed['Close']
-        df_processed['Low_Close_Ratio'] = df_processed['Low'] / df_processed['Close']
+        df_processed['Price_Range_Pct'] = self.safe_division(
+            df_processed['Price_Range'], df_processed['Close'], 0.0
+        )
+        df_processed['Open_Close_Ratio'] = self.safe_division(
+            df_processed['Open'], df_processed['Close'], 1.0
+        )
+        df_processed['High_Close_Ratio'] = self.safe_division(
+            df_processed['High'], df_processed['Close'], 1.0
+        )
+        df_processed['Low_Close_Ratio'] = self.safe_division(
+            df_processed['Low'], df_processed['Close'], 1.0
+        )
         
-        # 成交量相關特徵
+        print_cyan("  創建成交量特徵...")
+        # 成交量特徵
         if 'Volume' in df_processed.columns:
+            df_processed['Volume'] = np.maximum(df_processed['Volume'], 0)
             df_processed['Volume_Log'] = np.log1p(df_processed['Volume'])
             
-            # 成交量移動平均
-            df_processed['Volume_MA5'] = df_processed['Volume'].rolling(window=5).mean()
-            df_processed['Volume_MA10'] = df_processed['Volume'].rolling(window=10).mean()
-            df_processed['Volume_Ratio_5'] = df_processed['Volume'] / df_processed['Volume_MA5']
-            df_processed['Volume_Ratio_10'] = df_processed['Volume'] / df_processed['Volume_MA10']
+            df_processed['Volume_MA5'] = df_processed['Volume'].rolling(window=5, min_periods=1).mean()
+            df_processed['Volume_Ratio'] = self.safe_division(
+                df_processed['Volume'], df_processed['Volume_MA5'], 1.0
+            )
         
-        # 技術分析特徵
-        if all(col in df_processed.columns for col in ['MA5', 'MA10', 'MA20']):
-            df_processed['MA_Trend_5_10'] = (df_processed['MA5'] > df_processed['MA10']).astype(int)
-            df_processed['MA_Trend_10_20'] = (df_processed['MA10'] > df_processed['MA20']).astype(int)
-            df_processed['Price_Above_MA5'] = (df_processed['Close'] > df_processed['MA5']).astype(int)
-            df_processed['Price_Above_MA20'] = (df_processed['Close'] > df_processed['MA20']).astype(int)
-        
-        # RSI相關特徵
+        print_cyan("  創建技術指標特徵...")
+        # 技術指標特徵
         if 'RSI' in df_processed.columns:
-            df_processed['RSI_Overbought'] = (df_processed['RSI'] > 70).astype(int)
-            df_processed['RSI_Oversold'] = (df_processed['RSI'] < 30).astype(int)
-            df_processed['RSI_Neutral'] = ((df_processed['RSI'] >= 30) & (df_processed['RSI'] <= 70)).astype(int)
+            df_processed['RSI'] = np.clip(df_processed['RSI'], 0, 100)
+            df_processed['RSI_Normalized'] = df_processed['RSI'] / 100.0
+            df_processed['RSI_Overbought'] = (df_processed['RSI'] > 70).astype(float)
+            df_processed['RSI_Oversold'] = (df_processed['RSI'] < 30).astype(float)
         
-        # 布林通道相關特徵
-        if all(col in df_processed.columns for col in ['BB_Upper', 'BB_Lower', 'Close']):
-            df_processed['BB_Position'] = (df_processed['Close'] - df_processed['BB_Lower']) / (df_processed['BB_Upper'] - df_processed['BB_Lower'])
-            df_processed['BB_Squeeze'] = (df_processed['BB_Upper'] - df_processed['BB_Lower']) / df_processed['Close']
+        # MACD特徵
+        if 'MACD' in df_processed.columns:
+            df_processed['MACD_Signal_Diff'] = df_processed['MACD'] - df_processed.get('MACD_Signal', 0)
+            df_processed['MACD_Positive'] = (df_processed['MACD'] > 0).astype(float)
         
-        # 價格動量特徵
-        for window in [3, 5, 10]:
-            df_processed[f'Return_{window}d'] = df_processed['Close'].pct_change(window)
-            df_processed[f'Volatility_{window}d'] = df_processed['Close'].rolling(window=window).std()
+        # 移動平均特徵
+        ma_cols = [col for col in df_processed.columns if col.startswith('MA')]
+        for ma_col in ma_cols:
+            if ma_col in df_processed.columns:
+                ratio_col = f'{ma_col}_Price_Ratio'
+                df_processed[ratio_col] = self.safe_division(
+                    df_processed['Close'], df_processed[ma_col], 1.0
+                )
         
-        print("特徵工程完成")
+        print_cyan("  創建波動率特徵...")
+        # 波動率特徵
+        df_processed['Returns'] = df_processed['Close'].pct_change().fillna(0)
+        df_processed['Returns_Abs'] = np.abs(df_processed['Returns'])
+        df_processed['Volatility_5'] = df_processed['Returns'].rolling(window=5, min_periods=1).std().fillna(0)
+        
         return df_processed
     
-    def create_target_variables(self, df):
-        """創建目標變數（用於預測）"""
-        df_processed = df.copy()
+    def calculate_trading_day_steps(self, df, target_trading_days=5):
+        """計算實際交易日對應的時間步數"""
+        print_cyan(f"計算 {target_trading_days} 個交易日對應的時間步數...")
         
-        # 下一期價格變化
-        df_processed['Next_Close'] = df_processed['Close'].shift(-1)
-        df_processed['Next_Return'] = df_processed['Close'].pct_change(1).shift(-1)
-        
-        # 價格方向預測（二元分類）
-        df_processed['Price_Direction'] = (df_processed['Next_Return'] > 0).astype(int)
-        
-        # 價格變化幅度分類（多元分類）
-        df_processed['Return_Category'] = pd.cut(df_processed['Next_Return'], 
-                                               bins=[-np.inf, -0.02, -0.005, 0.005, 0.02, np.inf],
-                                               labels=['大跌', '小跌', '持平', '小漲', '大漲'])
-        
-        # 將類別編碼為數字
-        if 'Return_Category' in df_processed.columns:
-            le = LabelEncoder()
-            df_processed['Return_Category_Encoded'] = le.fit_transform(df_processed['Return_Category'].fillna('持平'))
-        
-        print("目標變數創建完成")
-        return df_processed
-    
-    def normalize_features(self, df, fit=True):
-        """正規化特徵"""
-        df_processed = df.copy()
-        
-        # 定義不需要正規化的欄位
-        exclude_cols = ['Datetime', 'stock_symbol', 'Year', 'Month', 'Day', 'Hour', 'Minute', 'DayOfWeek', 
-                       'DayOfYear', 'Dividends', 'Stock Splits', 'Price_Direction',
-                       'Return_Category', 'Return_Category_Encoded']
-        
-        # 獲取需要正規化的數值欄位
-        numeric_cols = df_processed.select_dtypes(include=[np.number]).columns
-        cols_to_normalize = [col for col in numeric_cols if col not in exclude_cols]
-        
-        if fit:
-            # 擬合並轉換
-            df_processed[cols_to_normalize] = self.scaler.fit_transform(df_processed[cols_to_normalize])
-            self.is_fitted = True
+        # 分析數據的時間間隔
+        sample_data = df.groupby('stock_symbol').first().reset_index()
+        if len(sample_data) > 0:
+            # 使用第一支股票分析時間模式
+            first_stock = sample_data.iloc[0]['stock_symbol']
+            stock_data = df[df['stock_symbol'] == first_stock].sort_values('Datetime')
             
-            # 儲存統計資訊
-            self.feature_stats = {
-                'mean': self.scaler.mean_ if hasattr(self.scaler, 'mean_') else None,
-                'scale': self.scaler.scale_ if hasattr(self.scaler, 'scale_') else None,
-                'feature_names': cols_to_normalize
-            }
+            # 計算每天的數據點數
+            stock_data['Date'] = stock_data['Datetime'].dt.date
+            daily_counts = stock_data.groupby('Date').size()
+            
+            # 排除週末（假設週末數據很少或沒有）
+            stock_data['DayOfWeek'] = stock_data['Datetime'].dt.dayofweek
+            weekday_data = stock_data[stock_data['DayOfWeek'] < 5]  # 0-4 是週一到週五
+            
+            if len(weekday_data) > 0:
+                weekday_data['Date'] = weekday_data['Datetime'].dt.date
+                weekday_daily_counts = weekday_data.groupby('Date').size()
+                avg_steps_per_day = weekday_daily_counts.mean()
+            else:
+                avg_steps_per_day = daily_counts.mean()
+            
+            # 計算目標交易日的步數
+            total_steps = int(avg_steps_per_day * target_trading_days)
+            
+            print_cyan(f"  平均每個交易日步數: {avg_steps_per_day:.1f}")
+            print_cyan(f"  {target_trading_days} 個交易日總步數: {total_steps}")
+            
+            return total_steps
         else:
-            if not self.is_fitted:
-                raise ValueError("Scaler has not been fitted yet. Call with fit=True first.")
-            # 只轉換
-            df_processed[cols_to_normalize] = self.scaler.transform(df_processed[cols_to_normalize])
+            # 默認值：假設每天48步（30分鐘間隔，24小時），5個交易日
+            return 48 * target_trading_days
         
-        print(f"特徵正規化完成 (方法: {self.scaling_method})")
-        print(f"   正規化欄位數: {len(cols_to_normalize)}")
+    def create_time_aware_sequences(self, df, sequence_length=60, target_trading_days=5, test_trading_days=10):
+        """創建時間感知的序列數據 - 考慮交易日曆"""
+        print_cyan(f"創建時間感知序列，測試期間: {test_trading_days} 個交易日")
         
-        return df_processed
-    
-    def prepare_for_ml(self, df):
-        """準備機器學習格式"""
-        df_processed = df.copy()
+        # 計算實際的預測步數
+        prediction_steps = self.calculate_trading_day_steps(df, target_trading_days)
         
-        # 移除最後一行（因為沒有下一期的目標值）
-        df_processed = df_processed[:-1]
+        # 定義特徵欄位
+        exclude_cols = [
+            'Datetime', 'stock_symbol', 'Year', 'Month', 'Day', 'Hour', 'Minute', 
+            'DayOfWeek', 'DayOfYear', 'Dividends', 'Stock Splits', 'Capital Gains', 'Date'
+        ]
         
-        # 移除仍有缺失值的行
-        initial_rows = len(df_processed)
-        df_processed = df_processed.dropna()
-        dropped_rows = initial_rows - len(df_processed)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        feature_cols = [col for col in numeric_cols if col not in exclude_cols]
         
-        if dropped_rows > 0:
-            print(f"移除了 {dropped_rows} 行包含缺失值的資料")
+        print_green(f"使用 {len(feature_cols)} 個特徵")
+        print_green(f"序列長度: {sequence_length}")
+        print_green(f"預測步數: {prediction_steps} (對應 {target_trading_days} 個交易日)")
         
-        # 分離特徵和目標變數
-        target_cols = ['Next_Close', 'Next_Return', 'Price_Direction', 'Return_Category_Encoded']
-        # 保留 Datetime 和 stock_symbol
-        preserve_cols = ['Datetime', 'stock_symbol']
-        feature_cols = [col for col in df_processed.columns 
-                       if col not in target_cols + ['Return_Category'] + preserve_cols]
+        # 找出全局的時間分割點 - 基於交易日
+        max_date = df['Datetime'].max()
+        min_date = df['Datetime'].min()
         
-        X = df_processed[feature_cols]
-        y_regression = df_processed['Next_Close'] # <--- 主要目標
-        y_secondary_regression = df_processed['Next_Return']
-        y_classification = df_processed['Price_Direction']
-        y_multiclass = df_processed['Return_Category_Encoded']
+        # 分析交易日分佈
+        df['Date'] = df['Datetime'].dt.date
+        df['DayOfWeek'] = df['Datetime'].dt.dayofweek
         
-        print("機器學習格式準備完成")
-        print(f"   特徵維度: {X.shape}")
-        print(f"   特徵數量: {len(feature_cols)}")
+        # 找出所有交易日（有數據的日期）- 只考慮工作日
+        trading_dates = []
+        for date in sorted(df['Date'].unique()):
+            date_data = df[df['Date'] == date]
+            # 檢查是否為工作日且有足夠的數據
+            if date_data['DayOfWeek'].iloc[0] < 5 and len(date_data) > 10:  # 週一到週五且有足夠數據
+                trading_dates.append(date)
+        
+        print_cyan(f"有效交易日數: {len(trading_dates)}")
+        
+        # 動態調整測試期間
+        if len(trading_dates) < test_trading_days:
+            adjusted_test_days = max(1, len(trading_dates) // 4)  # 使用1/4的數據作為測試
+            print_yellow(f"調整測試期間從 {test_trading_days} 到 {adjusted_test_days} 個交易日")
+            test_trading_days = adjusted_test_days
+        
+        # 取最後幾個交易日作為測試期
+        test_start_date = trading_dates[-test_trading_days]
+        test_start_datetime = pd.to_datetime(test_start_date)
+        
+        print_cyan(f"數據時間範圍: {min_date} 到 {max_date}")
+        print_cyan(f"有效交易日數: {len(trading_dates)}")
+        print_cyan(f"測試期開始日期: {test_start_date}")
+        print_cyan(f"實際測試期交易日數: {test_trading_days}")
+        
+        # 分別處理訓練和測試數據
+        train_data = df[df['Datetime'] < test_start_datetime].copy()
+        test_data = df[df['Datetime'] >= test_start_datetime].copy()
+        
+        print_cyan(f"訓練數據量: {len(train_data)}")
+        print_cyan(f"測試數據量: {len(test_data)}")
+        
+        if len(train_data) == 0:
+            raise ValueError("訓練數據為空，請調整test_trading_days參數")
+            
+        # 創建股票ID映射
+        unique_stocks = df['stock_symbol'].unique()
+        stock_to_id = {stock: i for i, stock in enumerate(unique_stocks)}
+        
+        # 創建訓練序列
+        train_sequences, train_targets, train_metadata = self._create_sequences_for_period(
+            train_data, feature_cols, stock_to_id, sequence_length, prediction_steps, 'train'
+        )
+        
+        # 創建測試序列 - 使用更寬鬆的條件
+        test_sequences, test_targets, test_metadata = self._create_sequences_for_period(
+            test_data, feature_cols, stock_to_id, sequence_length, prediction_steps, 'test', 
+            allow_shorter=True
+        )
+        
+        print_green(f"訓練序列: {len(train_sequences)}")
+        print_green(f"測試序列: {len(test_sequences)}")
         
         return {
-            'features': X,
-            'target_regression': y_regression,
-            'target_secondary_regression': y_secondary_regression,
-            'target_classification': y_classification,
-            'target_multiclass': y_multiclass,
-            'datetime': df_processed['Datetime'],
-            'stock_symbol': df_processed['stock_symbol'],
-            'feature_names': feature_cols,
-            'target_names': target_cols,
-            'time_step': 10 # <--- 在此處定義 time_step
+            'train_sequences': np.array(train_sequences),
+            'train_targets': np.array(train_targets),
+            'train_metadata': train_metadata,
+            'test_sequences': np.array(test_sequences) if test_sequences else np.array([]),
+            'test_targets': np.array(test_targets) if test_targets else np.array([]),
+            'test_metadata': test_metadata,
+            'feature_cols': feature_cols,
+            'stock_to_id': stock_to_id,
+            'test_start_date': test_start_datetime,
+            'prediction_steps': prediction_steps
         }
+        
+    def _create_sequences_for_period(self, data, feature_cols, stock_to_id, sequence_length, prediction_steps, period_name, allow_shorter=False):
+        """為特定時期創建序列 - 改進版本"""
+        sequences = []
+        targets = []
+        metadata = []
+        
+        for stock in stock_to_id.keys():
+            stock_data = data[data['stock_symbol'] == stock].sort_values('Datetime').reset_index(drop=True)
+            
+            # 根據期間調整最小數據要求
+            if period_name == 'test' and allow_shorter:
+                # 測試期允許更短的序列 - 大幅降低要求
+                min_required = sequence_length + max(10, prediction_steps // 10)  # 至少需要1/10的預測步數
+                print_cyan(f"  {period_name} - 股票 {stock}: 最小需求 {min_required}, 實際 {len(stock_data)}")
+            else:
+                min_required = sequence_length + prediction_steps
+            
+            if len(stock_data) < min_required:
+                print_yellow(f"  {period_name} - 股票 {stock} 數據不足 ({len(stock_data)} < {min_required})，跳過")
+                continue
+            
+            try:
+                features = stock_data[feature_cols].values
+                close_prices = stock_data['Close'].values
+                
+                # 檢查數據質量
+                if np.isnan(features).any() or np.isnan(close_prices).any():
+                    print_red(f"  {period_name} - 股票 {stock} 包含NaN值，跳過")
+                    continue
+                
+                stock_sequences = 0
+                
+                # 根據期間調整滑動窗口策略
+                if period_name == 'test' and allow_shorter:
+                    # 測試期：使用實際可用的數據長度
+                    actual_prediction_steps = min(prediction_steps, len(stock_data) - sequence_length)
+                    if actual_prediction_steps < 1:
+                        print_yellow(f"  {period_name} - 股票 {stock} 預測步數不足，跳過")
+                        continue
+                    
+                    # 只創建一個序列（最新的）
+                    max_start_idx = len(stock_data) - sequence_length - actual_prediction_steps
+                    start_indices = [max_start_idx] if max_start_idx >= 0 else []
+                else:
+                    # 訓練期：使用完整的滑動窗口
+                    actual_prediction_steps = prediction_steps
+                    start_indices = range(len(stock_data) - sequence_length - actual_prediction_steps + 1)
+                
+                # 創建序列
+                for i in start_indices:
+                    if i < 0:
+                        continue
+                        
+                    input_sequence = features[i:i + sequence_length]
+                    target_prices = close_prices[i + sequence_length:i + sequence_length + actual_prediction_steps]
+                    current_price = close_prices[i + sequence_length - 1]
+                    
+                    # 檢查目標價格是否有效
+                    if len(target_prices) == 0:
+                        continue
+                    
+                    # 如果目標長度不足，進行填充
+                    if len(target_prices) < prediction_steps:
+                        # 使用最後一個價格進行填充
+                        padding_length = prediction_steps - len(target_prices)
+                        last_price = target_prices[-1] if len(target_prices) > 0 else current_price
+                        target_prices = np.concatenate([target_prices, np.full(padding_length, last_price)])
+                    
+                    # 計算相對變化
+                    target_changes = (target_prices - current_price) / current_price
+                    
+                    # 檢查目標是否有效
+                    if np.isnan(target_changes).any() or np.isinf(target_changes).any():
+                        continue
+                    
+                    sequences.append(input_sequence)
+                    targets.append(target_changes)
+                    metadata.append({
+                        'stock_id': stock_to_id[stock],
+                        'stock_symbol': stock,
+                        'datetime': stock_data['Datetime'].iloc[i + sequence_length - 1],
+                        'current_price': current_price,
+                        'period': period_name,
+                        'actual_prediction_steps': actual_prediction_steps
+                    })
+                    stock_sequences += 1
+                
+                if stock_sequences > 0:
+                    print_green(f"  {period_name} - {stock}: 創建了 {stock_sequences} 個序列")
+                
+            except Exception as e:
+                print_red(f"  {period_name} - 處理股票 {stock} 時出錯: {e}")
+                continue
+        
+        return sequences, targets, metadata
     
-    def save_normalized_data(self, data, output_dir='normalized_data'):
-        """儲存正規化後的資料"""
+    def save_processed_data(self, processed_data, output_dir='normalized_data'):
+        """保存處理後的數據"""
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # 儲存特徵資料（包含datetime和stock_symbol）
-        features_file = os.path.join(output_dir, f'combined_features_{timestamp}.csv')
-        features_with_metadata = pd.concat([
-            data['datetime'].reset_index(drop=True),
-            data['stock_symbol'].reset_index(drop=True), 
-            data['features'].reset_index(drop=True)
-        ], axis=1)
-        features_with_metadata.to_csv(features_file, index=False)
-        print(f"特徵資料已儲存: {features_file}")
+        # 保存訓練數據
+        np.save(os.path.join(output_dir, f'train_sequences_{timestamp}.npy'), 
+                processed_data['train_sequences_normalized'])
+        np.save(os.path.join(output_dir, f'train_targets_{timestamp}.npy'), 
+                processed_data['train_targets_normalized'])
         
-        # 儲存目標變數
-        targets_file = os.path.join(output_dir, f'combined_targets_{timestamp}.csv')
-        target_df = pd.DataFrame({
-            'datetime': data['datetime'],
-            'stock_symbol': data['stock_symbol'],
-            'target_regression': data['target_regression'],
-            'target_classification': data['target_classification'],
-            'target_multiclass': data['target_multiclass']
-        })
-        target_df.to_csv(targets_file, index=False)
-        print(f"目標變數已儲存: {targets_file}")
+        # 保存測試數據
+        if len(processed_data['test_sequences_normalized']) > 0:
+            np.save(os.path.join(output_dir, f'test_sequences_{timestamp}.npy'), 
+                    processed_data['test_sequences_normalized'])
+            np.save(os.path.join(output_dir, f'test_targets_{timestamp}.npy'), 
+                    processed_data['test_targets_normalized'])
         
-        # 儲存scaler
-        scaler_file = os.path.join(output_dir, f'combined_scaler_{timestamp}.pkl')
-        with open(scaler_file, 'wb') as f:
-            pickle.dump(self.scaler, f)
-        print(f"Scaler已儲存: {scaler_file}")
-        
-        # 儲存特徵名稱和統計資訊
-        metadata_file = os.path.join(output_dir, f'combined_metadata_{timestamp}.pkl')
-        metadata = {
-            'feature_names': data['feature_names'],
-            'target_names': data['target_names'],
-            'scaling_method': self.scaling_method,
-            'feature_stats': self.feature_stats,
-            'total_stocks': len(csv_files),
-            'total_samples': len(combined_features),
-            'time_step': ml_data['time_step'], # <--- 儲存 time_step
-            'target_col': 'Next_Close' # <--- 儲存目標欄位名稱
-        }
+        # 保存元數據
+        metadata_file = os.path.join(output_dir, f'metadata_{timestamp}.pkl')
         with open(metadata_file, 'wb') as f:
-            pickle.dump(metadata, f)
-        print(f"元數據已儲存: {metadata_file}")
+            pickle.dump({
+                'train_metadata': processed_data['train_metadata'],
+                'test_metadata': processed_data['test_metadata'],
+                'feature_cols': processed_data['feature_cols'],
+                'stock_to_id': processed_data['stock_to_id'],
+                'feature_scaler': self.feature_scaler,
+                'target_scaler': self.target_scaler,
+                'test_start_date': processed_data['test_start_date'],
+                'prediction_steps': processed_data['prediction_steps'],
+                'timestamp': timestamp
+            }, f)
+        
+        print_green(f"數據已保存到 {output_dir}")
+        print_cyan(f"預測步數: {processed_data['prediction_steps']}")
         
         return {
-            'features_file': features_file,
-            'targets_file': targets_file,
-            'scaler_file': scaler_file,
+            'train_sequences_file': os.path.join(output_dir, f'train_sequences_{timestamp}.npy'),
+            'train_targets_file': os.path.join(output_dir, f'train_targets_{timestamp}.npy'),
+            'test_sequences_file': os.path.join(output_dir, f'test_sequences_{timestamp}.npy'),
+            'test_targets_file': os.path.join(output_dir, f'test_targets_{timestamp}.npy'),
             'metadata_file': metadata_file
         }
-
-
-def main():
-    """主函數 - 執行完整的資料正規化流程"""
-    print("股票資料正規化開始...")
-    print("=" * 60)
+    def save_processed_chunk_data(self, processed_data, output_dir='normalized_data_temp', chunk_index=0):
+        """保存處理後的數據"""
+        os.makedirs(output_dir, exist_ok=True)
     
-    DATA_DIR = 'data/feature'
-    
-    # 收集所有處理過的資料
-    all_processed_data = []
-    
-    # 初始化正規化器
-    normalizer = StockDataNormalizer(scaling_method='standard')
-    
-    csv_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
-    print(f"發現 {len(csv_files)} 個CSV檔案: {csv_files}")
-    
-    # 第一階段：預處理所有檔案但不正規化
-    print("\n第一階段：預處理所有檔案...")
-    for i, csv_file in enumerate(csv_files):
-        csv_file_path = os.path.join(DATA_DIR, csv_file)
-        print(f"\n處理檔案 [{i+1}/{len(csv_files)}]: {csv_file}")
         
-        if not os.path.exists(csv_file_path):
-            print(f"檔案不存在: {csv_file_path}")
-            continue
-    
-        # 載入資料
-        df = normalizer.load_data(csv_file_path)
-        if df is None:
-            continue
-    
-        # 分析資料品質
-        quality_analysis = normalizer.analyze_data_quality(df)
+        # 保存訓練數據
+        np.save(os.path.join(output_dir, f'train_sequences_{chunk_index}.npy'), 
+                processed_data['train_sequences_normalized'])
+        np.save(os.path.join(output_dir, f'train_targets_{chunk_index}.npy'), 
+                processed_data['train_targets_normalized'])
         
-        # 預處理步驟（不包含正規化）
-        print("\n開始資料預處理...")
-        df = normalizer.preprocess_datetime(df)
-        df = normalizer.handle_missing_values(df)
-        df = normalizer.create_features(df)
-        df = normalizer.create_target_variables(df)
+        # 保存測試數據
+        if len(processed_data['test_sequences_normalized']) > 0:
+            np.save(os.path.join(output_dir, f'test_sequences_{chunk_index}.npy'), 
+                    processed_data['test_sequences_normalized'])
+            np.save(os.path.join(output_dir, f'test_targets_{chunk_index}.npy'), 
+                    processed_data['test_targets_normalized'])
         
-        # 儲存預處理後的資料
-        all_processed_data.append(df)
-    
-    if not all_processed_data:
-        print("沒有成功處理任何檔案！")
-        return
-    
-    # 第二階段：合併所有資料並統一正規化
-    print(f"\n第二階段：合併 {len(all_processed_data)} 個股票的資料...")
-    combined_df = pd.concat(all_processed_data, ignore_index=True)
-    print(f"合併後資料形狀: {combined_df.shape}")
-    
-    # 對合併後的資料進行正規化
-    print("\n進行統一正規化...")
-    combined_df = normalizer.normalize_features(combined_df, fit=True)
-    
-    # 準備機器學習格式
-    print("\n準備機器學習格式...")
-    ml_data = normalizer.prepare_for_ml(combined_df)
-    
-    # 準備最終的特徵和目標資料
-    features_with_meta = pd.concat([
-        ml_data['datetime'].reset_index(drop=True),
-        ml_data['stock_symbol'].reset_index(drop=True),
-        ml_data['features'].reset_index(drop=True)
-    ], axis=1)
-    
-    targets_with_meta = pd.DataFrame({
-        'datetime': ml_data['datetime'],
-        'stock_symbol': ml_data['stock_symbol'],
-        'target_regression': ml_data['target_regression'],
-        'target_classification': ml_data['target_classification'],
-        'target_multiclass': ml_data['target_multiclass']
-    })
-    
-    if all_processed_data:
-        # 合併所有資料
-        # print(f"\n合併 {len(all_features)} 個股票的資料...")
-        # combined_features = pd.concat(all_features, ignore_index=True)
-        # combined_targets = pd.concat(all_targets, ignore_index=True)
-        combined_features = features_with_meta
-        combined_targets = targets_with_meta
+        # 保存元數據
+        # metadata_file = os.path.join(output_dir, f'metadata_{chunk_index}.pkl')
+        # with open(metadata_file, 'wb') as f:
+        #     pickle.dump({
+        #         'train_metadata': processed_data['train_metadata'],
+        #         'test_metadata': processed_data['test_metadata'],
+        #         'feature_cols': processed_data['feature_cols'],
+        #         'stock_to_id': processed_data['stock_to_id'],
+        #         'feature_scaler': self.feature_scaler,
+        #         'target_scaler': self.target_scaler,
+        #         'test_start_date': processed_data['test_start_date'],
+        #         'prediction_steps': processed_data['prediction_steps'],
+        #         'timestamp': timestamp
+        #     }, f)
         
-        # 儲存合併後的資料
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        print_green(f"數據已保存到 {output_dir}")
+        print_cyan(f"預測步數: {processed_data['prediction_steps']}")
+        
+        return {
+            'train_sequences_file': os.path.join(output_dir, f'train_sequences_{chunk_index}.npy'),
+            'train_targets_file': os.path.join(output_dir, f'train_targets_{chunk_index}.npy'),
+            'test_sequences_file': os.path.join(output_dir, f'test_sequences_{chunk_index}.npy'),
+            'test_targets_file': os.path.join(output_dir, f'test_targets_{chunk_index}.npy'),
+            # 'metadata_file': metadata_file
+        }
+        
+    def process_in_chunks(self, data_dir='data/feature', chunk_size=5):
+        """分塊處理數據"""
+        print_green("開始分塊處理超大數據集...")
+        
+        # 只處理部分股票
+        csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+        print_cyan(f"總共 {len(csv_files)} 個文件，分塊處理")
+        
+        # 創建輸出目錄
         output_dir = 'normalized_data'
         os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # 儲存特徵資料
-        features_file = os.path.join(output_dir, f'combined_features_{timestamp}.csv')
-        combined_features.to_csv(features_file, index=False)
-        print(f"合併特徵資料已儲存: {features_file}")
+        # 分塊處理
+        for chunk_start in range(0, len(csv_files), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(csv_files))
+            chunk_files = csv_files[chunk_start:chunk_end]
+            
+            print_cyan(f"處理塊 {chunk_start//chunk_size + 1}: {chunk_files}")
+            
+            # 處理當前塊
+            chunk_data = self._process_chunk(chunk_files, data_dir , chunk_start//chunk_size + 1)
+            
+            if chunk_data is not None:
+                # 保存當前塊
+                chunk_file = os.path.join(output_dir, f'chunk_{chunk_start//chunk_size + 1}_{timestamp}.pkl')
+                with open(chunk_file, 'wb') as f:
+                    pickle.dump(chunk_data, f)
+                
+                print_green(f"塊 {chunk_start//chunk_size + 1} 處理完成")
+                
+                # 清理內存
+                del chunk_data
+                gc.collect()
         
-        # 儲存目標資料
-        targets_file = os.path.join(output_dir, f'combined_targets_{timestamp}.csv')
-        combined_targets.to_csv(targets_file, index=False)
-        print(f"合併目標資料已儲存: {targets_file}")
-        
-        # 儲存scaler和metadata
-        scaler_file = os.path.join(output_dir, f'combined_scaler_{timestamp}.pkl')
-        with open(scaler_file, 'wb') as f:
-            pickle.dump(normalizer.scaler, f)
-        print(f"Scaler已儲存: {scaler_file}")
-        
-        metadata_file = os.path.join(output_dir, f'combined_metadata_{timestamp}.pkl')
-        metadata = {
-            'feature_names': ml_data['feature_names'],
-            'target_names': ml_data['target_names'],
-            'scaling_method': normalizer.scaling_method,
-            'feature_stats': normalizer.feature_stats,
-            'total_stocks': len(csv_files),
-            'total_samples': len(combined_features),
-            'time_step': ml_data['time_step'], # <--- 儲存 time_step
-            'target_col': 'Next_Close' # <--- 儲存目標欄位名稱
-        }
-        with open(metadata_file, 'wb') as f:
-            pickle.dump(metadata, f)
-        print(f"元數據已儲存: {metadata_file}")
-        
-        # 顯示總結
-        print("\n" + "=" * 60)
-        print("資料正規化完成！")
-        print(f"最終資料形狀: {combined_features.shape}")
-        print(f"特徵數量: {len(ml_data['feature_names'])}")
-        print(f"股票數量: {len(csv_files)}")
-        print(f"總樣本數: {len(combined_features)}")
-        print(f"目標變數: {len(ml_data['target_names'])}")
-        
-        print("\n已生成的檔案:")
-        print(f"   features_file: {features_file}")
-        print(f"   targets_file: {targets_file}")
-        print(f"   scaler_file: {scaler_file}")
-        print(f"   metadata_file: {metadata_file}")
-        
-        print("\n使用建議:")
-        print("   1. 使用 combined_features.csv 作為模型輸入")
-        print("   2. datetime 和 stock_symbol 已保留在特徵中")
-        print("   3. 使用 combined_targets.csv 中的目標變數進行訓練")
-        print("   4. 回歸任務: target_regression")
-        print("   5. 二元分類: target_classification")
-        print("   6. 多元分類: target_multiclass")
-        print("   7. 載入 combined_scaler.pkl 對新資料進行相同的正規化")
-    else:
-        print("沒有成功處理任何檔案！")
 
+        # merge all processed chunks
+        print_cyan("合併所有處理過的塊...")
+        process_data = dict()
+        process_data['train_metadata'] = []
+        process_data['test_metadata'] = []
+        process_data['stock_to_id'] = []
+        process_data['feature_cols'] = []
+        process_data['feature_scaler'] = self.feature_scaler
+        process_data['target_scaler'] = self.target_scaler
+        process_data['test_start_date'] = None
+        process_data['prediction_steps'] = None
+        process_data['timestamp'] = timestamp
+        for chunk_file in os.listdir(output_dir+'_temp'):
+            if chunk_file.endswith('.npy'):
+                output_file_name = ''
+                if 'train_sequences' in chunk_file:
+                    output_file_name = f'train_sequences_file_{timestamp}.npy'
+                elif 'train_targets' in chunk_file:
+                    output_file_name = f'train_targets_file_{timestamp}.npy'
+                elif 'test_sequences' in chunk_file:
+                    output_file_name = f'test_sequences_file_{timestamp}.npy'
+                elif 'test_targets' in chunk_file:
+                    output_file_name = f'test_targets_file_{timestamp}.npy'
+                    
+                with open(os.path.join(output_dir, chunk_file), 'rb') as f:
+                    chunk_data = pickle.load(f)
+                    process_data['train_metadata'].append(chunk_data)
+                    process_data['test_metadata'].append(chunk_data)
+                    process_data['stock_to_id'].append(chunk_data)
+                    if process_data['feature_cols']:
+                        process_data['feature_cols'] = chunk_data['feature_cols']
+                with open(os.path.join(output_dir, output_file_name), 'ab') as f:
+                    pickle.dump(chunk_data, f)
+        
+        # 保存元數據
+        print_green("\\4. 保存元數據...")
+        metadata_file = os.path.join(output_dir, f'metadata_{timestamp}.pkl')
+        with open(metadata_file, 'wb') as f:
+            pickle.dump({
+                'train_metadata': process_data['train_metadata'],
+                'test_metadata': process_data['test_metadata'],
+                'feature_cols': process_data['feature_cols'],
+                'stock_to_id': process_data['stock_to_id'],
+                'feature_scaler': self.feature_scaler,
+                'target_scaler': self.target_scaler,
+                'test_start_date': process_data['test_start_date'],
+                'prediction_steps': process_data['prediction_steps'],
+                'timestamp': timestamp
+            }, f)
+
+        print_green("所有塊處理完成！")
+
+    def _process_chunk(self, files, data_dir , chunk_id):
+        """處理單個數據塊"""
+        all_data = []
+        
+        for csv_file in files:
+            file_path = os.path.join(data_dir, csv_file)
+            stock_symbol = os.path.splitext(csv_file)[0]
+            
+            try:
+                df = pd.read_csv(file_path)
+                df['stock_symbol'] = stock_symbol
+                df['Datetime'] = pd.to_datetime(df['Datetime'])
+                
+                # 清理數據
+                df = self.clean_data(df)
+                
+                # 基本特徵工程
+                df = self._create_robust_features(df)
+                
+                # 再次清理
+                df = self.clean_data(df)
+                
+                all_data.append(df)
+                
+            except Exception as e:
+                print_red(f"處理 {csv_file} 時出錯: {e}")
+                continue
+        
+        if not all_data:
+            return None
+        
+        combined_df = pd.concat(all_data, ignore_index=True)
+        combined_df = combined_df.sort_values(['stock_symbol', 'Datetime']).reset_index(drop=True)
+        
+        # 最終清理
+        combined_df = self.clean_data(combined_df)
+        
+        print_green(f"合併後數據形狀: {combined_df.shape}")
+        
+        # 創建時間感知序列
+        data = self.create_time_aware_sequences(
+            combined_df, sequence_length=60, target_trading_days=5, test_trading_days=10
+        )
+        
+        try:
+            processed_data = self.normalize_data(data)
+            print_green("標準化成功完成！")
+        except Exception as e:
+            print_red(f"標準化失敗: {e}")
+            raise
+
+
+        print_green("\n4. 保存數據...")
+        files = self.save_processed_chunk_data(processed_data , chunk_index=chunk_id)
+
+    def normalize_data(self, data):
+        """使用時間感知的標準化 - 改進版本"""
+        print_cyan("開始時間感知標準化...")
+        
+        train_sequences = data['train_sequences']
+        train_targets = data['train_targets']
+        test_sequences = data['test_sequences']
+        test_targets = data['test_targets']
+        
+        print_cyan(f"訓練序列形狀: {train_sequences.shape}")
+        print_cyan(f"測試序列形狀: {test_sequences.shape}")
+        
+        # 檢查內存使用情況
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        print_cyan(f"當前內存使用: {memory_info.rss / 1024 / 1024:.1f} MB")
+        
+        # 計算需要的內存
+        train_flat_size = train_sequences.shape[0] * train_sequences.shape[1] * train_sequences.shape[2]
+        estimated_memory_gb = train_flat_size * 8 / (1024**3)  # 假設float64
+        print_cyan(f"預估標準化需要內存: {estimated_memory_gb:.1f} GB")
+        
+        if estimated_memory_gb > 4:  # 如果超過4GB，使用批量處理
+            print_yellow("數據量過大，使用批量標準化...")
+            return self._normalize_data_batch(data)
+        
+        try:
+            # 只使用訓練數據來擬合標準化器
+            print_cyan("重塑訓練序列數據...")
+            train_sequences_flat = train_sequences.reshape(-1, train_sequences.shape[-1])
+            train_targets_flat = train_targets.reshape(-1, 1)
+            
+            print_cyan(f"重塑後訓練序列形狀: {train_sequences_flat.shape}")
+            print_cyan(f"重塑後訓練目標形狀: {train_targets_flat.shape}")
+            
+            # 標準化特徵
+            print_cyan("使用訓練數據擬合特徵標準化器...")
+            sequences_normalized_train = self.feature_scaler.fit_transform(train_sequences_flat)
+            print_cyan("特徵標準化完成，重塑回原始形狀...")
+            sequences_normalized_train = sequences_normalized_train.reshape(train_sequences.shape)
+            
+            # 標準化目標
+            print_cyan("使用訓練數據擬合目標標準化器...")
+            targets_normalized_train = self.target_scaler.fit_transform(train_targets_flat)
+            print_cyan("目標標準化完成，重塑回原始形狀...")
+            targets_normalized_train = targets_normalized_train.reshape(train_targets.shape)
+            
+            # 清理中間變量
+            del train_sequences_flat, train_targets_flat
+            import gc
+            gc.collect()
+            
+            # 應用標準化到測試數據
+            if len(test_sequences) > 0:
+                print_cyan("標準化測試數據...")
+                test_sequences_flat = test_sequences.reshape(-1, test_sequences.shape[-1])
+                test_targets_flat = test_targets.reshape(-1, 1)
+                
+                sequences_normalized_test = self.feature_scaler.transform(test_sequences_flat)
+                sequences_normalized_test = sequences_normalized_test.reshape(test_sequences.shape)
+                
+                targets_normalized_test = self.target_scaler.transform(test_targets_flat)
+                targets_normalized_test = targets_normalized_test.reshape(test_targets.shape)
+                
+                # 清理中間變量
+                del test_sequences_flat, test_targets_flat
+                gc.collect()
+            else:
+                sequences_normalized_test = np.array([])
+                targets_normalized_test = np.array([])
+            
+            # 清理NaN值
+            print_cyan("清理NaN值...")
+            sequences_normalized_train = np.nan_to_num(sequences_normalized_train, nan=0.0)
+            targets_normalized_train = np.nan_to_num(targets_normalized_train, nan=0.0)
+            sequences_normalized_test = np.nan_to_num(sequences_normalized_test, nan=0.0)
+            targets_normalized_test = np.nan_to_num(targets_normalized_test, nan=0.0)
+            
+            self.is_fitted = True
+            
+            print_green("✓ 時間感知標準化完成")
+            
+            return {
+                'train_sequences_normalized': sequences_normalized_train,
+                'train_targets_normalized': targets_normalized_train,
+                'test_sequences_normalized': sequences_normalized_test,
+                'test_targets_normalized': targets_normalized_test,
+                'train_metadata': data['train_metadata'],
+                'test_metadata': data['test_metadata'],
+                'feature_cols': data['feature_cols'],
+                'stock_to_id': data['stock_to_id'],
+                'test_start_date': data['test_start_date'],
+                'prediction_steps': data['prediction_steps']
+            }
+            
+        except MemoryError as e:
+            print_red(f"內存不足: {e}")
+            print_yellow("切換到批量標準化...")
+            return self._normalize_data_batch(data)
+        except Exception as e:
+            print_red(f"標準化過程中出錯: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+    def _normalize_data_batch(self, data):
+        """批量標準化數據 - 終極保守版本"""
+        print_cyan("開始批量標準化...")
+        
+        train_sequences = data['train_sequences']
+        train_targets = data['train_targets']
+        test_sequences = data['test_sequences']
+        test_targets = data['test_targets']
+        
+        batch_size = 100  # 進一步減少批量大小
+        
+        # 第一步：使用極少量數據擬合標準化器
+        print_cyan("使用極少量數據擬合標準化器...")
+        sample_size = min(500, len(train_sequences))  # 只使用500個樣本
+        sample_indices = np.random.choice(len(train_sequences), sample_size, replace=False)
+        
+        # 分批次擬合標準化器
+        print_cyan("分批次擬合標準化器...")
+        feature_samples = []
+        target_samples = []
+        
+        for i in range(0, sample_size, 50):  # 每次只處理50個樣本
+            end_idx = min(i + 50, sample_size)
+            batch_indices = sample_indices[i:end_idx]
+            
+            batch_sequences = train_sequences[batch_indices]
+            batch_targets = train_targets[batch_indices]
+            
+            # 重塑並收集
+            batch_seq_flat = batch_sequences.reshape(-1, batch_sequences.shape[-1])
+            batch_tar_flat = batch_targets.reshape(-1, 1)
+            
+            feature_samples.append(batch_seq_flat)
+            target_samples.append(batch_tar_flat)
+            
+            # 清理
+            del batch_sequences, batch_targets, batch_seq_flat, batch_tar_flat
+            import gc
+            gc.collect()
+        
+        # 合併樣本並擬合
+        print_cyan("合併樣本並擬合標準化器...")
+        all_feature_samples = np.vstack(feature_samples)
+        all_target_samples = np.vstack(target_samples)
+        
+        self.feature_scaler.fit(all_feature_samples)
+        self.target_scaler.fit(all_target_samples)
+        
+        # 清理
+        del feature_samples, target_samples, all_feature_samples, all_target_samples
+        gc.collect()
+        
+        print_green("✓ 標準化器擬合完成")
+        
+        # 第二步：直接保存到文件而不是內存
+        print_cyan("直接保存標準化結果到文件...")
+        
+        # 創建輸出目錄
+        output_dir = 'normalized_data'
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 直接保存訓練數據
+        train_file = os.path.join(output_dir, f'train_sequences_{timestamp}.npy')
+        train_target_file = os.path.join(output_dir, f'train_targets_{timestamp}.npy')
+        
+        print_cyan("直接批量處理並保存訓練數據...")
+        
+        # 創建空的npy文件
+        np.save(train_file, np.array([]))
+        np.save(train_target_file, np.array([]))
+        
+        # 用append模式寫入
+        train_results = []
+        train_target_results = []
+        
+        total_batches = (len(train_sequences) + batch_size - 1) // batch_size
+        
+        for i in range(0, len(train_sequences), batch_size):
+            end_idx = min(i + batch_size, len(train_sequences))
+            batch_num = i // batch_size + 1
+            
+            if batch_num % 50 == 0:  # 每50批輸出一次
+                print_cyan(f"訓練數據批次 {batch_num}/{total_batches}")
+            
+            try:
+                batch_seq = train_sequences[i:end_idx]
+                batch_tar = train_targets[i:end_idx]
+                
+                batch_seq_flat = batch_seq.reshape(-1, batch_seq.shape[-1])
+                batch_tar_flat = batch_tar.reshape(-1, 1)
+                
+                batch_seq_norm = self.feature_scaler.transform(batch_seq_flat)
+                batch_tar_norm = self.target_scaler.transform(batch_tar_flat)
+                
+                # 重塑並清理NaN
+                batch_seq_reshaped = batch_seq_norm.reshape(batch_seq.shape)
+                batch_tar_reshaped = batch_tar_norm.reshape(batch_tar.shape)
+                
+                # 逐步清理NaN
+                batch_seq_clean = np.nan_to_num(batch_seq_reshaped, nan=0.0, posinf=0.0, neginf=0.0)
+                batch_tar_clean = np.nan_to_num(batch_tar_reshaped, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                train_results.append(batch_seq_clean)
+                train_target_results.append(batch_tar_clean)
+                
+                # 清理
+                del batch_seq, batch_tar, batch_seq_flat, batch_tar_flat
+                del batch_seq_norm, batch_tar_norm, batch_seq_reshaped, batch_tar_reshaped
+                del batch_seq_clean, batch_tar_clean
+                gc.collect()
+                
+                # 每累積一定數量就保存一次
+                if len(train_results) >= 10 or batch_num == total_batches:
+                    print_cyan(f"保存累積的批次數據...")
+                    
+                    # 合併並保存
+                    if len(train_results) > 0:
+                        combined_seq = np.vstack(train_results)
+                        combined_tar = np.vstack(train_target_results)
+                        
+                        # 如果是第一次保存，直接保存；否則追加
+                        if i < batch_size * 10:  # 第一次
+                            np.save(train_file, combined_seq)
+                            np.save(train_target_file, combined_tar)
+                        else:  # 追加
+                            existing_seq = np.load(train_file)
+                            existing_tar = np.load(train_target_file)
+                            
+                            new_seq = np.vstack([existing_seq, combined_seq])
+                            new_tar = np.vstack([existing_tar, combined_tar])
+                            
+                            np.save(train_file, new_seq)
+                            np.save(train_target_file, new_tar)
+                            
+                            del existing_seq, existing_tar, new_seq, new_tar
+                        
+                        del combined_seq, combined_tar
+                        train_results = []
+                        train_target_results = []
+                        gc.collect()
+                    
+            except Exception as e:
+                print_red(f"批次 {batch_num} 處理出錯: {e}")
+                continue
+        
+        # 處理測試數據
+        if len(test_sequences) > 0:
+            print_cyan("直接批量處理並保存測試數據...")
+            
+            test_file = os.path.join(output_dir, f'test_sequences_{timestamp}.npy')
+            test_target_file = os.path.join(output_dir, f'test_targets_{timestamp}.npy')
+            
+            test_results = []
+            test_target_results = []
+            
+            for i in range(0, len(test_sequences), batch_size):
+                end_idx = min(i + batch_size, len(test_sequences))
+                
+                try:
+                    batch_seq = test_sequences[i:end_idx]
+                    batch_tar = test_targets[i:end_idx]
+                    
+                    batch_seq_flat = batch_seq.reshape(-1, batch_seq.shape[-1])
+                    batch_tar_flat = batch_tar.reshape(-1, 1)
+                    
+                    batch_seq_norm = self.feature_scaler.transform(batch_seq_flat)
+                    batch_tar_norm = self.target_scaler.transform(batch_tar_flat)
+                    
+                    batch_seq_reshaped = batch_seq_norm.reshape(batch_seq.shape)
+                    batch_tar_reshaped = batch_tar_norm.reshape(batch_tar.shape)
+                    
+                    batch_seq_clean = np.nan_to_num(batch_seq_reshaped, nan=0.0, posinf=0.0, neginf=0.0)
+                    batch_tar_clean = np.nan_to_num(batch_tar_reshaped, nan=0.0, posinf=0.0, neginf=0.0)
+                    
+                    test_results.append(batch_seq_clean)
+                    test_target_results.append(batch_tar_clean)
+                    
+                    del batch_seq, batch_tar, batch_seq_flat, batch_tar_flat
+                    del batch_seq_norm, batch_tar_norm, batch_seq_reshaped, batch_tar_reshaped
+                    del batch_seq_clean, batch_tar_clean
+                    gc.collect()
+                    
+                except Exception as e:
+                    print_red(f"測試批次處理出錯: {e}")
+                    continue
+            
+            # 保存測試數據
+            if len(test_results) > 0:
+                combined_test_seq = np.vstack(test_results)
+                combined_test_tar = np.vstack(test_target_results)
+                
+                np.save(test_file, combined_test_seq)
+                np.save(test_target_file, combined_test_tar)
+                
+                del combined_test_seq, combined_test_tar
+                test_results = []
+                test_target_results = []
+                gc.collect()
+        
+        # 載入最終結果
+        print_cyan("載入最終結果...")
+        train_seq_final = np.load(train_file)
+        train_tar_final = np.load(train_target_file)
+        
+        if len(test_sequences) > 0:
+            test_seq_final = np.load(test_file)
+            test_tar_final = np.load(test_target_file)
+        else:
+            test_seq_final = np.array([])
+            test_tar_final = np.array([])
+        
+        self.is_fitted = True
+        
+        print_green("✓ 極保守批量標準化完成")
+        
+        return {
+            'train_sequences_normalized': train_seq_final,
+            'train_targets_normalized': train_tar_final,
+            'test_sequences_normalized': test_seq_final,
+            'test_targets_normalized': test_tar_final,
+            'train_metadata': data['train_metadata'],
+            'test_metadata': data['test_metadata'],
+            'feature_cols': data['feature_cols'],
+            'stock_to_id': data['stock_to_id'],
+            'test_start_date': data['test_start_date'],
+            'prediction_steps': data['prediction_steps']
+        }
+def main():
+    """主函數"""
+    print_green("=" * 60)
+    print_green("時間感知數據預處理開始（考慮交易日曆）...")
+    print_green("=" * 60)
+    
+    normalizer = TimeAwareStockDataNormalizer()
+    
+    try:
+        # 1. 載入和預處理數據
+        print_green("\n1. 載入和預處理數據...")
+        combined_df = normalizer.load_and_preprocess_data()
+        
+        # 2. 創建時間感知序列
+        print_green("\n2. 創建時間感知序列...")
+        data = normalizer.create_time_aware_sequences(
+            combined_df, 
+            sequence_length=60,
+            target_trading_days=5,      # 預測5個交易日
+            test_trading_days=10        # 增加測試期到10個交易日
+        )
+        
+        # 內存檢查
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        print_cyan(f"序列創建後內存使用: {memory_info.rss / 1024 / 1024:.1f} MB")
+        
+        # 3. 標準化數據
+        print_green("\n3. 時間感知標準化...")
+        try:
+            processed_data = normalizer.normalize_data(data)
+            print_green("標準化成功完成！")
+        except Exception as e:
+            print_red(f"標準化失敗: {e}")
+            raise
+        
+        # 4. 保存數據
+        print_green("\n4. 保存數據...")
+        files = normalizer.save_processed_data(processed_data)
+        
+        # 5. 數據質量檢查
+        print_green("\n5. 數據質量檢查...")
+        train_seq = processed_data['train_sequences_normalized']
+        test_seq = processed_data['test_sequences_normalized']
+        
+        print_cyan(f"最終統計:")
+        print_cyan(f"  訓練序列: {train_seq.shape}")
+        print_cyan(f"  測試序列: {test_seq.shape}")
+        print_cyan(f"  特徵維度: {train_seq.shape[2]}")
+        print_cyan(f"  預測步數: {processed_data['prediction_steps']}")
+        print_cyan(f"  測試開始日期: {processed_data['test_start_date']}")
+        
+        # 最終內存檢查
+        memory_info = process.memory_info()
+        print_cyan(f"完成後內存使用: {memory_info.rss / 1024 / 1024:.1f} MB")
+        
+        print_green("\n✓ 時間感知數據預處理完成！")
+        print_green("✓ 已避免look-ahead bias")
+        print_green("✓ 已考慮交易日曆限制")
+        
+    except KeyboardInterrupt:
+        print_red("\n✗ 用戶中斷程序")
+    except MemoryError as e:
+        print_red(f"\n✗ 內存不足: {e}")
+        print_yellow("建議：")
+        print_yellow("1. 減少序列長度 (sequence_length)")
+        print_yellow("2. 減少預測步數 (target_trading_days)")
+        print_yellow("3. 增加系統內存")
+    except Exception as e:
+        print_red(f"\n✗ 處理過程中出錯: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()

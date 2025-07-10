@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-更強健的資料正規化腳本 - 徹底解決NaN問題
+修復時間洩漏的強健版資料正規化腳本
 """
 
 import pandas as pd
@@ -9,13 +9,13 @@ from colors import *
 from sklearn.preprocessing import StandardScaler
 import warnings
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import pickle
 
 warnings.filterwarnings('ignore')
 
-class RobustStockDataNormalizer:
-    """強健版股票資料正規化器"""
+class TimeAwareStockDataNormalizer:
+    """時間感知的股票資料正規化器 - 避免look-ahead bias"""
     
     def __init__(self):
         self.feature_scaler = StandardScaler()
@@ -40,7 +40,7 @@ class RobustStockDataNormalizer:
             # 替換無限值
             df_clean[col] = np.where(np.isinf(df_clean[col]), np.nan, df_clean[col])
             
-            # 處理極端異常值 (超過99.9%分位數或低於0.1%分位數)
+            # 處理極端異常值
             if df_clean[col].notna().sum() > 0:
                 q_low = df_clean[col].quantile(0.001)
                 q_high = df_clean[col].quantile(0.999)
@@ -49,7 +49,6 @@ class RobustStockDataNormalizer:
         # 2. 填充NaN值
         for col in numeric_cols:
             if df_clean[col].isnull().sum() > 0:
-                # 使用中位數填充
                 median_val = df_clean[col].median()
                 if pd.isna(median_val):
                     median_val = 0.0
@@ -127,7 +126,7 @@ class RobustStockDataNormalizer:
         df_processed['Month_cos'] = np.cos(2 * np.pi * df_processed['Month'] / 12)
         
         print_cyan("  創建價格特徵...")
-        # 價格特徵 - 使用安全除法
+        # 價格特徵
         df_processed['Price_Range'] = df_processed['High'] - df_processed['Low']
         df_processed['Price_Range_Pct'] = self.safe_division(
             df_processed['Price_Range'], df_processed['Close'], 0.0
@@ -145,11 +144,9 @@ class RobustStockDataNormalizer:
         print_cyan("  創建成交量特徵...")
         # 成交量特徵
         if 'Volume' in df_processed.columns:
-            # 確保Volume非負
             df_processed['Volume'] = np.maximum(df_processed['Volume'], 0)
             df_processed['Volume_Log'] = np.log1p(df_processed['Volume'])
             
-            # 成交量移動平均
             df_processed['Volume_MA5'] = df_processed['Volume'].rolling(window=5, min_periods=1).mean()
             df_processed['Volume_Ratio'] = self.safe_division(
                 df_processed['Volume'], df_processed['Volume_MA5'], 1.0
@@ -158,7 +155,6 @@ class RobustStockDataNormalizer:
         print_cyan("  創建技術指標特徵...")
         # 技術指標特徵
         if 'RSI' in df_processed.columns:
-            # 確保RSI在合理範圍內
             df_processed['RSI'] = np.clip(df_processed['RSI'], 0, 100)
             df_processed['RSI_Normalized'] = df_processed['RSI'] / 100.0
             df_processed['RSI_Overbought'] = (df_processed['RSI'] > 70).astype(float)
@@ -173,7 +169,6 @@ class RobustStockDataNormalizer:
         ma_cols = [col for col in df_processed.columns if col.startswith('MA')]
         for ma_col in ma_cols:
             if ma_col in df_processed.columns:
-                # MA與當前價格的比率
                 ratio_col = f'{ma_col}_Price_Ratio'
                 df_processed[ratio_col] = self.safe_division(
                     df_processed['Close'], df_processed[ma_col], 1.0
@@ -187,228 +182,250 @@ class RobustStockDataNormalizer:
         
         return df_processed
     
-    def create_sequences_and_targets(self, df, sequence_length=60, prediction_steps=336):
-        """創建序列數據和目標變數"""
-        all_sequences = []
-        all_targets = []
-        all_metadata = []
+    def create_time_aware_sequences(self, df, sequence_length=60, prediction_steps=336, test_days=7):
+        """創建時間感知的序列數據 - 避免look-ahead bias"""
+        print_cyan(f"創建時間感知序列，測試期間: {test_days} 天")
         
-        # 定義特徵欄位 - 排除非數值和標識列
+        # 定義特徵欄位
         exclude_cols = [
             'Datetime', 'stock_symbol', 'Year', 'Month', 'Day', 'Hour', 'Minute', 
-            'DayOfWeek', 'DayOfYear', 'Dividends', 'Stock Splits',
-            'Capital Gains'  # 添加這個可能存在的列
+            'DayOfWeek', 'DayOfYear', 'Dividends', 'Stock Splits', 'Capital Gains'
         ]
         
-        # 只選擇數值型特徵
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         feature_cols = [col for col in numeric_cols if col not in exclude_cols]
         
         print_green(f"使用 {len(feature_cols)} 個特徵")
-        print_cyan(f"特徵列表前10個: {feature_cols[:10]}")
         
+        # 找出全局的時間分割點
+        max_date = df['Datetime'].max()
+        min_date = df['Datetime'].min()
+
+        # 測試期: 最新的7天
+        test_start_date = max_date - timedelta(days=test_days)
+        
+        print_cyan(f"數據時間範圍: {min_date} 到 {max_date}")
+        print_cyan(f"訓練期結束: {test_start_date}")
+        print_cyan(f"測試期開始: {test_start_date}")
+        
+        # 分別處理訓練和測試數據
+        train_data = df[df['Datetime'] < test_start_date].copy()
+        test_data = df[df['Datetime'] >= test_start_date].copy()
+        
+        print_cyan(f"訓練數據量: {len(train_data)}")
+        print_cyan(f"測試數據量: {len(test_data)}")
+        
+        if len(train_data) == 0 or len(test_data) == 0:
+            raise ValueError("訓練或測試數據為空，請調整test_days參數")
+        
+        # 創建股票ID映射
         unique_stocks = df['stock_symbol'].unique()
         stock_to_id = {stock: i for i, stock in enumerate(unique_stocks)}
         
-        successful_sequences = 0
+        # 創建訓練序列
+        train_sequences, train_targets, train_metadata = self._create_sequences_for_period(
+            train_data, feature_cols, stock_to_id, sequence_length, prediction_steps, 'train'
+        )
         
-        for stock in unique_stocks:
-            stock_data = df[df['stock_symbol'] == stock].sort_values('Datetime').reset_index(drop=True)
+        # 創建測試序列
+        test_sequences, test_targets, test_metadata = self._create_sequences_for_period(
+            test_data, feature_cols, stock_to_id, sequence_length, prediction_steps, 'test'
+        )
+        
+        print_green(f"訓練序列: {len(train_sequences)}")
+        print_green(f"測試序列: {len(test_sequences)}")
+        
+        return {
+            'train_sequences': np.array(train_sequences),
+            'train_targets': np.array(train_targets),
+            'train_metadata': train_metadata,
+            'test_sequences': np.array(test_sequences) if test_sequences else np.array([]),
+            'test_targets': np.array(test_targets) if test_targets else np.array([]),
+            'test_metadata': test_metadata,
+            'feature_cols': feature_cols,
+            'stock_to_id': stock_to_id,
+            'test_start_date': test_start_date
+        }
+    
+    def _create_sequences_for_period(self, data, feature_cols, stock_to_id, sequence_length, prediction_steps, period_name):
+        """為特定時期創建序列"""
+        sequences = []
+        targets = []
+        metadata = []
+        
+        for stock in stock_to_id.keys():
+            stock_data = data[data['stock_symbol'] == stock].sort_values('Datetime').reset_index(drop=True)
             
             if len(stock_data) < sequence_length + prediction_steps:
-                print_yellow(f"股票 {stock} 數據不足 ({len(stock_data)} < {sequence_length + prediction_steps})，跳過")
+                print_yellow(f"  {period_name} - 股票 {stock} 數據不足，跳過")
                 continue
             
-            # 提取特徵和Close價格
             try:
                 features = stock_data[feature_cols].values
                 close_prices = stock_data['Close'].values
                 
                 # 檢查數據質量
                 if np.isnan(features).any() or np.isnan(close_prices).any():
-                    print_red(f"股票 {stock} 包含NaN值，跳過")
+                    print_red(f"  {period_name} - 股票 {stock} 包含NaN值，跳過")
                     continue
                 
-                if np.isinf(features).any() or np.isinf(close_prices).any():
-                    print_red(f"股票 {stock} 包含無限值，跳過")
-                    continue
-                
-                # 創建滑動窗口
                 stock_sequences = 0
+                # 創建滑動窗口
                 for i in range(len(stock_data) - sequence_length - prediction_steps + 1):
-                    # 輸入序列
                     input_sequence = features[i:i + sequence_length]
-                    
-                    # 目標價格
                     target_prices = close_prices[i + sequence_length:i + sequence_length + prediction_steps]
                     current_price = close_prices[i + sequence_length - 1]
                     
-                    # 計算相對變化 (百分比)
+                    # 計算相對變化
                     target_changes = (target_prices - current_price) / current_price
                     
                     # 檢查目標是否有效
                     if np.isnan(target_changes).any() or np.isinf(target_changes).any():
                         continue
                     
-                    all_sequences.append(input_sequence)
-                    all_targets.append(target_changes)
-                    
-                    all_metadata.append({
+                    sequences.append(input_sequence)
+                    targets.append(target_changes)
+                    metadata.append({
                         'stock_id': stock_to_id[stock],
                         'stock_symbol': stock,
                         'datetime': stock_data['Datetime'].iloc[i + sequence_length - 1],
-                        'current_price': current_price
+                        'current_price': current_price,
+                        'period': period_name
                     })
-                    
                     stock_sequences += 1
                 
-                successful_sequences += stock_sequences
-                print_green(f"  ✓ {stock}: 創建了 {stock_sequences} 個序列")
+                if stock_sequences > 0:
+                    print_green(f"  {period_name} - {stock}: 創建了 {stock_sequences} 個序列")
                 
             except Exception as e:
-                print_red(f"  ✗ 處理股票 {stock} 時出錯: {e}")
+                print_red(f"  {period_name} - 處理股票 {stock} 時出錯: {e}")
                 continue
         
-        print_green(f"總共創建了 {successful_sequences} 個有效序列")
-        
-        if successful_sequences == 0:
-            raise ValueError("沒有創建任何有效序列")
-        
-        return {
-            'sequences': np.array(all_sequences),
-            'targets': np.array(all_targets),
-            'metadata': all_metadata,
-            'feature_cols': feature_cols,
-            'stock_to_id': stock_to_id
-        }
+        return sequences, targets, metadata
     
     def normalize_data(self, data):
-        """正規化特徵和目標，徹底避免NaN"""
-        sequences = data['sequences']
-        targets = data['targets']
+        """使用時間感知的標準化"""
+        print_cyan("開始時間感知標準化...")
         
-        print_cyan("開始數據標準化...")
-        print_cyan(f"標準化前 - 序列形狀: {sequences.shape}, 目標形狀: {targets.shape}")
+        train_sequences = data['train_sequences']
+        train_targets = data['train_targets']
+        test_sequences = data['test_sequences']
+        test_targets = data['test_targets']
         
-        # 檢查輸入數據
-        if np.isnan(sequences).any():
-            print_red("警告: 輸入序列包含NaN值，將被替換為0")
-            sequences = np.nan_to_num(sequences, nan=0.0, posinf=0.0, neginf=0.0)
+        print_cyan(f"訓練序列形狀: {train_sequences.shape}")
+        print_cyan(f"測試序列形狀: {test_sequences.shape}")
         
-        if np.isnan(targets).any():
-            print_red("警告: 輸入目標包含NaN值，將被替換為0")
-            targets = np.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # 重塑數據進行標準化
-        original_shape = sequences.shape
-        sequences_flat = sequences.reshape(-1, sequences.shape[-1])
+        # 只使用訓練數據來擬合標準化器
+        train_sequences_flat = train_sequences.reshape(-1, train_sequences.shape[-1])
+        train_targets_flat = train_targets.reshape(-1, 1)
         
         # 標準化特徵
-        print_cyan("標準化特徵...")
-        try:
-            sequences_normalized = self.feature_scaler.fit_transform(sequences_flat)
-            sequences_normalized = sequences_normalized.reshape(original_shape)
-        except Exception as e:
-            print_red(f"特徵標準化失敗: {e}")
-            # 手動標準化
-            mean = np.nanmean(sequences_flat, axis=0)
-            std = np.nanstd(sequences_flat, axis=0)
-            std = np.where(std == 0, 1, std)  # 避免除零
-            sequences_normalized = (sequences_flat - mean) / std
-            sequences_normalized = sequences_normalized.reshape(original_shape)
+        print_cyan("使用訓練數據擬合特徵標準化器...")
+        sequences_normalized_train = self.feature_scaler.fit_transform(train_sequences_flat)
+        sequences_normalized_train = sequences_normalized_train.reshape(train_sequences.shape)
         
-        # 標準化目標變數
-        print_cyan("標準化目標...")
-        targets_flat = targets.reshape(-1, 1)
-        try:
-            targets_normalized = self.target_scaler.fit_transform(targets_flat)
-            targets_normalized = targets_normalized.reshape(targets.shape)
-        except Exception as e:
-            print_red(f"目標標準化失敗: {e}")
-            # 手動標準化
-            mean = np.nanmean(targets_flat)
-            std = np.nanstd(targets_flat)
-            if std == 0:
-                std = 1
-            targets_normalized = (targets_flat - mean) / std
-            targets_normalized = targets_normalized.reshape(targets.shape)
+        # 標準化目標
+        print_cyan("使用訓練數據擬合目標標準化器...")
+        targets_normalized_train = self.target_scaler.fit_transform(train_targets_flat)
+        targets_normalized_train = targets_normalized_train.reshape(train_targets.shape)
         
-        # 最終清理
-        sequences_normalized = np.nan_to_num(sequences_normalized, nan=0.0, posinf=0.0, neginf=0.0)
-        targets_normalized = np.nan_to_num(targets_normalized, nan=0.0, posinf=0.0, neginf=0.0)
+        # 應用標準化到測試數據
+        if len(test_sequences) > 0:
+            test_sequences_flat = test_sequences.reshape(-1, test_sequences.shape[-1])
+            test_targets_flat = test_targets.reshape(-1, 1)
+            
+            sequences_normalized_test = self.feature_scaler.transform(test_sequences_flat)
+            sequences_normalized_test = sequences_normalized_test.reshape(test_sequences.shape)
+            
+            targets_normalized_test = self.target_scaler.transform(test_targets_flat)
+            targets_normalized_test = targets_normalized_test.reshape(test_targets.shape)
+        else:
+            sequences_normalized_test = np.array([])
+            targets_normalized_test = np.array([])
+        
+        # 清理NaN值
+        sequences_normalized_train = np.nan_to_num(sequences_normalized_train, nan=0.0)
+        targets_normalized_train = np.nan_to_num(targets_normalized_train, nan=0.0)
+        sequences_normalized_test = np.nan_to_num(sequences_normalized_test, nan=0.0)
+        targets_normalized_test = np.nan_to_num(targets_normalized_test, nan=0.0)
         
         self.is_fitted = True
         
-        # 最終檢查
-        if np.isnan(sequences_normalized).any() or np.isnan(targets_normalized).any():
-            raise ValueError("標準化後仍有NaN值，這不應該發生")
-        
-        print_green("✓ 數據標準化完成")
-        print_green(f"特徵數據形狀: {sequences_normalized.shape}")
-        print_green(f"目標數據形狀: {targets_normalized.shape}")
+        print_green("✓ 時間感知標準化完成")
         
         return {
-            'sequences_normalized': sequences_normalized,
-            'targets_normalized': targets_normalized,
-            'metadata': data['metadata'],
+            'train_sequences_normalized': sequences_normalized_train,
+            'train_targets_normalized': targets_normalized_train,
+            'test_sequences_normalized': sequences_normalized_test,
+            'test_targets_normalized': targets_normalized_test,
+            'train_metadata': data['train_metadata'],
+            'test_metadata': data['test_metadata'],
             'feature_cols': data['feature_cols'],
-            'stock_to_id': data['stock_to_id']
+            'stock_to_id': data['stock_to_id'],
+            'test_start_date': data['test_start_date']
         }
     
-    def save_processed_data(self, processed_data, output_dir='robust_normalized_data'):
+    def save_processed_data(self, processed_data, output_dir='time_aware_normalized_data'):
         """保存處理後的數據"""
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # 保存為numpy格式
-        sequences_file = os.path.join(output_dir, f'sequences_{timestamp}.npy')
-        targets_file = os.path.join(output_dir, f'targets_{timestamp}.npy')
+        # 保存訓練數據
+        np.save(os.path.join(output_dir, f'train_sequences_{timestamp}.npy'), 
+                processed_data['train_sequences_normalized'])
+        np.save(os.path.join(output_dir, f'train_targets_{timestamp}.npy'), 
+                processed_data['train_targets_normalized'])
         
-        np.save(sequences_file, processed_data['sequences_normalized'])
-        np.save(targets_file, processed_data['targets_normalized'])
+        # 保存測試數據
+        if len(processed_data['test_sequences_normalized']) > 0:
+            np.save(os.path.join(output_dir, f'test_sequences_{timestamp}.npy'), 
+                    processed_data['test_sequences_normalized'])
+            np.save(os.path.join(output_dir, f'test_targets_{timestamp}.npy'), 
+                    processed_data['test_targets_normalized'])
         
         # 保存元數據
         metadata_file = os.path.join(output_dir, f'metadata_{timestamp}.pkl')
         with open(metadata_file, 'wb') as f:
             pickle.dump({
-                'metadata': processed_data['metadata'],
+                'train_metadata': processed_data['train_metadata'],
+                'test_metadata': processed_data['test_metadata'],
                 'feature_cols': processed_data['feature_cols'],
                 'stock_to_id': processed_data['stock_to_id'],
                 'feature_scaler': self.feature_scaler,
                 'target_scaler': self.target_scaler,
+                'test_start_date': processed_data['test_start_date'],
                 'timestamp': timestamp
             }, f)
         
-        print_green(f"數據已保存:")
-        print_green(f"  序列: {sequences_file}")
-        print_green(f"  目標: {targets_file}")
-        print_green(f"  元數據: {metadata_file}")
+        print_green(f"數據已保存到 {output_dir}")
         
         return {
-            'sequences_file': sequences_file,
-            'targets_file': targets_file,
+            'train_sequences_file': os.path.join(output_dir, f'train_sequences_{timestamp}.npy'),
+            'train_targets_file': os.path.join(output_dir, f'train_targets_{timestamp}.npy'),
+            'test_sequences_file': os.path.join(output_dir, f'test_sequences_{timestamp}.npy'),
+            'test_targets_file': os.path.join(output_dir, f'test_targets_{timestamp}.npy'),
             'metadata_file': metadata_file
         }
 
 def main():
     """主函數"""
     print_green("=" * 60)
-    print_green("強健版數據預處理開始...")
+    print_green("時間感知數據預處理開始...")
     print_green("=" * 60)
     
-    normalizer = RobustStockDataNormalizer()
+    normalizer = TimeAwareStockDataNormalizer()
     
     try:
         # 1. 載入和預處理數據
         print_green("\n1. 載入和預處理數據...")
         combined_df = normalizer.load_and_preprocess_data()
         
-        # 2. 創建序列和目標
-        print_green("\n2. 創建序列和目標...")
-        data = normalizer.create_sequences_and_targets(combined_df)
+        # 2. 創建時間感知序列
+        print_green("\n2. 創建時間感知序列...")
+        data = normalizer.create_time_aware_sequences(combined_df, test_days=3)
         
         # 3. 標準化數據
-        print_green("\n3. 標準化數據...")
+        print_green("\n3. 時間感知標準化...")
         processed_data = normalizer.normalize_data(data)
         
         # 4. 保存數據
@@ -417,28 +434,17 @@ def main():
         
         # 5. 數據質量檢查
         print_green("\n5. 數據質量檢查...")
-        sequences = processed_data['sequences_normalized']
-        targets = processed_data['targets_normalized']
+        train_seq = processed_data['train_sequences_normalized']
+        test_seq = processed_data['test_sequences_normalized']
         
         print_cyan(f"最終統計:")
-        print_cyan(f"  序列數量: {sequences.shape[0]}")
-        print_cyan(f"  特徵維度: {sequences.shape[2]}")
-        print_cyan(f"  序列長度: {sequences.shape[1]}")
-        print_cyan(f"  預測步數: {targets.shape[1]}")
+        print_cyan(f"  訓練序列: {train_seq.shape}")
+        print_cyan(f"  測試序列: {test_seq.shape}")
+        print_cyan(f"  特徵維度: {train_seq.shape[2]}")
+        print_cyan(f"  測試開始日期: {processed_data['test_start_date']}")
         
-        print_cyan(f"特徵統計:")
-        print_cyan(f"  平均值: {sequences.mean():.6f}")
-        print_cyan(f"  標準差: {sequences.std():.6f}")
-        print_cyan(f"  最小值: {sequences.min():.6f}")
-        print_cyan(f"  最大值: {sequences.max():.6f}")
-        
-        print_cyan(f"目標統計:")
-        print_cyan(f"  平均值: {targets.mean():.6f}")
-        print_cyan(f"  標準差: {targets.std():.6f}")
-        print_cyan(f"  最小值: {targets.min():.6f}")
-        print_cyan(f"  最大值: {targets.max():.6f}")
-        
-        print_green("\n✓ 強健版數據預處理完成！")
+        print_green("\n✓ 時間感知數據預處理完成！")
+        print_green("✓ 已避免look-ahead bias")
         
     except Exception as e:
         print_red(f"\n✗ 處理過程中出錯: {e}")
