@@ -22,28 +22,132 @@ warnings.filterwarnings('ignore')
 
 from stock_transformer import StockTransformer
 
-def load_fixed_data():
-    """載入修復後的數據"""
-    data_dir = 'robust_normalized_data'
+
+
+def load_time_normalized_data():
+    """Load time-normalized data - compatible with main.py"""
+    data_dir = 'time_normalized_data'
     
-    # 找到最新的檔案
-    npy_files = glob.glob(os.path.join(data_dir, 'sequences_*.npy'))
-    if not npy_files:
-        raise FileNotFoundError("找不到處理後的數據檔案")
+    # Find latest files
+    train_seq_files = glob.glob(os.path.join(data_dir, 'train_sequences_*.npy'))
+    if not train_seq_files:
+        raise FileNotFoundError("No time-normalized training data found")
     
-    latest_seq_file = max(npy_files, key=os.path.getctime)
-    timestamp_match = re.search(r'_(\d{8}_\d{6})\.npy', latest_seq_file)
+    latest_train_file = max(train_seq_files, key=os.path.getctime)
+    timestamp_match = re.search(r'_(\d{8}_\d{6})\.npy', latest_train_file)
     timestamp = timestamp_match.group(1)
     
-    # 載入數據
-    sequences = np.load(latest_seq_file)
-    targets = np.load(os.path.join(data_dir, f'targets_{timestamp}.npy'))
+    # Load all data
+    train_sequences = np.load(os.path.join(data_dir, f'train_sequences_{timestamp}.npy'))
+    train_targets = np.load(os.path.join(data_dir, f'train_targets_{timestamp}.npy'))
     
+    # Check if test data exists
+    test_seq_file = os.path.join(data_dir, f'test_sequences_{timestamp}.npy')
+    test_tar_file = os.path.join(data_dir, f'test_targets_{timestamp}.npy')
+    
+    if os.path.exists(test_seq_file) and os.path.exists(test_tar_file):
+        test_sequences = np.load(test_seq_file)
+        test_targets = np.load(test_tar_file)
+    else:
+        print_yellow("No test data found, creating empty arrays")
+        test_sequences = np.array([])
+        test_targets = np.array([])
+    
+    # Load metadata
     with open(os.path.join(data_dir, f'metadata_{timestamp}.pkl'), 'rb') as f:
         metadata = pickle.load(f)
     
-    print_green(f"載入數據: 序列 {sequences.shape}, 目標 {targets.shape}")
-    return sequences, targets, metadata
+    print_green(f"Loaded time-normalized data:")
+    print_green(f"  Training: {train_sequences.shape}")
+    print_green(f"  Test: {test_sequences.shape}")
+    print_green(f"  Test period: {metadata.get('test_start_date', 'N/A')}")
+    
+    # Create metadata objects for train and test
+    train_metadata = metadata['train_metadata']
+    test_metadata = metadata['test_metadata']
+    
+    return {
+        'train_sequences': train_sequences,
+        'test_sequences': test_sequences,
+        'train_targets': train_targets,
+        'test_targets': test_targets,
+        'train_metadata': train_metadata,
+        'test_metadata': test_metadata,
+        'full_metadata': metadata
+    }
+
+
+def time_based_split(sequences, targets, metadata, test_days=6):
+    """基於時間的數據分割"""
+    print_cyan(f"\n按時間分割數據，測試期: 最新 {test_days} 天")
+    
+    # 提取所有時間戳
+    all_datetimes = []
+    for i, item in enumerate(metadata['metadata']):
+        datetime_val = item['datetime']
+        if isinstance(datetime_val, str):
+            datetime_val = pd.to_datetime(datetime_val)
+        all_datetimes.append((i, datetime_val))
+    
+    # 按時間排序
+    all_datetimes.sort(key=lambda x: x[1])
+    
+    # 找出所有唯一的日期
+    unique_dates = sorted(list(set([dt.date() for _, dt in all_datetimes])))
+    print_cyan(f"數據時間範圍: {unique_dates[0]} 到 {unique_dates[-1]}")
+    print_cyan(f"總共 {len(unique_dates)} 天的數據")
+    
+    # 確定測試期開始日期
+    if len(unique_dates) <= test_days:
+        print_yellow(f"警告: 總天數 {len(unique_dates)} 小於等於測試天數 {test_days}")
+        test_start_date = unique_dates[len(unique_dates)//2]  # 使用後一半作為測試
+        print_yellow(f"調整測試開始日期為: {test_start_date}")
+    else:
+        test_start_date = unique_dates[-test_days]
+    
+    print_cyan(f"測試期開始日期: {test_start_date}")
+    print_cyan(f"訓練期: {unique_dates[0]} 到 {test_start_date - timedelta(days=1)}")
+    print_cyan(f"測試期: {test_start_date} 到 {unique_dates[-1]}")
+    
+    # 分割索引
+    train_indices = []
+    test_indices = []
+    
+    for i, datetime_val in all_datetimes:
+        if datetime_val.date() < test_start_date:
+            train_indices.append(i)
+        else:
+            test_indices.append(i)
+    
+    print_cyan(f"訓練樣本數: {len(train_indices)}")
+    print_cyan(f"測試樣本數: {len(test_indices)}")
+    
+    if len(test_indices) == 0:
+        raise ValueError("測試集為空，請調整 test_days 參數")
+    
+    # 分割數據
+    train_sequences = sequences[train_indices]
+    test_sequences = sequences[test_indices]
+    train_targets = targets[train_indices]
+    test_targets = targets[test_indices]
+    
+    # 分割元數據
+    train_metadata = [metadata['metadata'][i] for i in train_indices]
+    test_metadata = [metadata['metadata'][i] for i in test_indices]
+    
+    # 檢查各股票在訓練集和測試集的分佈
+    train_stocks = set([item['stock_symbol'] for item in train_metadata])
+    test_stocks = set([item['stock_symbol'] for item in test_metadata])
+    
+    print_cyan(f"\n股票分佈:")
+    print_cyan(f"  訓練集股票數: {len(train_stocks)}")
+    print_cyan(f"  測試集股票數: {len(test_stocks)}")
+    print_cyan(f"  共同股票數: {len(train_stocks & test_stocks)}")
+    
+    if len(train_stocks & test_stocks) == 0:
+        print_red("警告: 訓練集和測試集沒有共同股票！")
+    
+    return train_sequences, test_sequences, train_targets, test_targets, train_metadata, test_metadata
 
 class FocalMSELoss(nn.Module):
     """改進的損失函數 - 專注於難預測的樣本"""
@@ -445,43 +549,61 @@ def print_prediction_summary(predictions):
         json.dump(result, f, ensure_ascii=False, indent=4)
 
 def train_optimized_model():
-    """訓練優化後的模型"""
+    """訓練優化後的模型 - 使用時間分割"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print_green(f"使用設備: {device}")
     
-    # 載入數據
-    sequences, targets, metadata = load_fixed_data()
+    # 載入按時間分割的數據
+    data_dict = load_time_normalized_data()
+    
+    train_sequences = data_dict['train_sequences']
+    test_sequences = data_dict['test_sequences']
+    train_targets = data_dict['train_targets']
+    test_targets = data_dict['test_targets']
+    train_metadata = data_dict['train_metadata']
+    test_metadata = data_dict['test_metadata']
+    full_metadata = data_dict['full_metadata']
     
     # 提取元數據
-    stock_to_id = metadata['stock_to_id']
-    feature_scaler = metadata['feature_scaler']
-    target_scaler = metadata['target_scaler']
-    feature_cols = metadata['feature_cols']
+    stock_to_id = full_metadata['stock_to_id']
+    feature_scaler = full_metadata['feature_scaler']
+    target_scaler = full_metadata['target_scaler']
+    feature_cols = full_metadata['feature_cols']
     
     # 創建股票ID數組
-    stock_ids = np.array([item['stock_id'] for item in metadata['metadata']])
+    train_stock_ids = np.array([item['stock_id'] for item in train_metadata])
+    test_stock_ids = np.array([item['stock_id'] for item in test_metadata])
     
-    print_cyan(f"數據統計:")
-    print_cyan(f"  序列數量: {len(sequences)}")
-    print_cyan(f"  特徵維度: {sequences.shape[-1]}")
-    print_cyan(f"  預測步數: {targets.shape[-1]}")
+    print_cyan(f"\n時間分割後的數據統計:")
+    print_cyan(f"  訓練序列數量: {len(train_sequences)}")
+    print_cyan(f"  測試序列數量: {len(test_sequences)}")
+    print_cyan(f"  特徵維度: {train_sequences.shape[-1]}")
+    print_cyan(f"  預測步數: {train_targets.shape[-1]}")
     print_cyan(f"  股票數量: {len(stock_to_id)}")
     
-    # 分析目標分布
-    print_cyan(f"\n目標變數分析:")
-    print_cyan(f"  標準化後目標 - 均值: {targets.mean():.4f}, 標準差: {targets.std():.4f}")
-    print_cyan(f"  標準化後目標 - 最小值: {targets.min():.4f}, 最大值: {targets.max():.4f}")
+    # 進一步分割訓練集為訓練/驗證 (80/20)
+    # train_seq, val_seq, train_tar, val_tar, train_ids, val_ids = train_test_split(
+    #     train_sequences, train_targets, train_stock_ids, 
+    #     test_size=0.2, random_state=42, stratify=train_stock_ids
+    # )
+
+    from sklearn.model_selection import GroupShuffleSplit
+
+    gss = GroupShuffleSplit(test_size=0.2, random_state=42)
+    # 這裡 groups=train_stock_ids，確保同一 group (股票) 不會被分到不同集
+    train_idx, val_idx = next(gss.split(train_sequences, train_targets, groups=train_stock_ids))
+
+    train_seq, val_seq = train_sequences[train_idx], train_sequences[val_idx]
+    train_tar, val_tar = train_targets[train_idx],   train_targets[val_idx]
+    train_ids,  val_ids  = train_stock_ids[train_idx], train_stock_ids[val_idx]
+
     
-    # 分割數據
-    train_seq, val_seq, train_tar, val_tar, train_ids, val_ids = train_test_split(
-        sequences, targets, stock_ids, test_size=0.2, random_state=42, stratify=stock_ids
-    )
-    
-    print_cyan(f"\n數據分割:")
+    print_cyan(f"\n最終數據分割:")
     print_cyan(f"  訓練集: {len(train_seq)} 個序列")
     print_cyan(f"  驗證集: {len(val_seq)} 個序列")
+    print_cyan(f"  測試集: {len(test_sequences)} 個序列")
     
-    # 創建數據加載器 - 優化配置
+    # 創建數據加載器
     train_dataset = TensorDataset(
         torch.FloatTensor(train_seq),
         torch.FloatTensor(train_tar),
@@ -491,6 +613,11 @@ def train_optimized_model():
         torch.FloatTensor(val_seq),
         torch.FloatTensor(val_tar),
         torch.LongTensor(val_ids)
+    )
+    test_dataset = TensorDataset(
+        torch.FloatTensor(test_sequences),
+        torch.FloatTensor(test_targets),
+        torch.LongTensor(test_stock_ids)
     )
     
     # 優化的數據加載器
@@ -507,7 +634,16 @@ def train_optimized_model():
         val_dataset, 
         batch_size=64, 
         shuffle=False,
-        num_workers=4,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=64, 
+        shuffle=False,
+        num_workers=8,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2
@@ -515,13 +651,13 @@ def train_optimized_model():
 
     # 創建優化的模型
     model = StockTransformer(
-        input_dim=sequences.shape[-1],
+        input_dim=train_sequences.shape[-1],
         num_stocks=len(stock_to_id),
         d_model=256,
         nhead=8,
-        num_layers=32,  # 減少層數
+        num_layers=24,  # 減少層數
         dropout=0.1,
-        prediction_horizon=targets.shape[-1]
+        prediction_horizon=train_targets.shape[-1]
     ).to(device)
     
     # 編譯模型
@@ -539,9 +675,12 @@ def train_optimized_model():
         weight_decay=1e-4,
         betas=(0.9, 0.999)
     )
-    
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+
     # 使用預熱學習率調度
-    num_epochs = 2
+    num_epochs = 100
     warmup_epochs = 10
     scheduler = WarmupCosineScheduler(optimizer, warmup_epochs, num_epochs, 1e-4, 1e-6)
     
@@ -618,12 +757,14 @@ def train_optimized_model():
             # 保存最佳模型
             torch.save({
                 'model_state_dict': model.state_dict(),
-                'metadata': metadata,
+                'full_metadata': full_metadata,
+                'train_metadata': train_metadata,
+                'test_metadata': test_metadata,
                 'epoch': epoch,
                 'train_loss': avg_train_loss,
                 'val_loss': avg_val_loss,
                 'optimizer_state_dict': optimizer.state_dict(),
-            }, 'best_optimized_model.pth')
+            }, 'best_time_split_model.pth')
         else:
             patience_counter += 1
         
@@ -640,41 +781,66 @@ def train_optimized_model():
             print_yellow(f"早停在第 {epoch+1} 個epoch (patience: {patience})")
             break
     
+    # 刪除不用的記憶體
+    del train_loader, optimizer, scheduler, scaler, model
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+
     # 載入最佳模型進行評估
-    checkpoint = torch.load('best_optimized_model.pth', weights_only=False)
+    checkpoint = torch.load('best_time_split_model.pth', weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
-    
-    # 評估模型
+    # 評估模型在驗證集和測試集上的性能
     print_magenta("\n評估模型性能...")
-    metrics = evaluate_model(model, val_loader, target_scaler, device)
     
+    # 驗證集評估
+    val_metrics = evaluate_model(model, val_loader, target_scaler, device)
     print_blue(f"\n驗證集性能:")
-    print_blue(f"  RMSE: {metrics['rmse']:.4f}")
-    print_blue(f"  MAE: {metrics['mae']:.4f}")
-    print_blue(f"  MAPE: {metrics['mape']:.2f}%")
-    print_blue(f"  1天方向準確率: {metrics['direction_accuracy_1d']:.4f}")
-    print_blue(f"  7天方向準確率: {metrics['direction_accuracy_7d']:.4f}")
+    print_blue(f"  RMSE: {val_metrics['rmse']:.4f}")
+    print_blue(f"  MAE: {val_metrics['mae']:.4f}")
+    print_blue(f"  MAPE: {val_metrics['mape']:.2f}%")
+    print_blue(f"  1天方向準確率: {val_metrics['direction_accuracy_1d']:.4f}")
+    print_blue(f"  7天方向準確率: {val_metrics['direction_accuracy_7d']:.4f}")
     
-    # 只保存關鍵評估指標
+    # 測試集評估 (真正的未見過數據)
+    test_metrics = evaluate_model(model, test_loader, target_scaler, device)
+    print_green(f"\n測試集性能 (未見過的最新6天數據):")
+    print_green(f"  RMSE: {test_metrics['rmse']:.4f}")
+    print_green(f"  MAE: {test_metrics['mae']:.4f}")
+    print_green(f"  MAPE: {test_metrics['mape']:.2f}%")
+    print_green(f"  1天方向準確率: {test_metrics['direction_accuracy_1d']:.4f}")
+    print_green(f"  7天方向準確率: {test_metrics['direction_accuracy_7d']:.4f}")
+    
+    # 保存評估指標
     metrics_summary = {
-        'rmse': metrics['rmse'],
-        'mae': metrics['mae'],
-        'mape': metrics['mape'],
-        'direction_accuracy_1d': metrics['direction_accuracy_1d'],
-        'direction_accuracy_7d': metrics['direction_accuracy_7d']
+        'validation': {
+            'rmse': val_metrics['rmse'],
+            'mae': val_metrics['mae'],
+            'mape': val_metrics['mape'],
+            'direction_accuracy_1d': val_metrics['direction_accuracy_1d'],
+            'direction_accuracy_7d': val_metrics['direction_accuracy_7d']
+        },
+        'test': {
+            'rmse': test_metrics['rmse'],
+            'mae': test_metrics['mae'],
+            'mape': test_metrics['mape'],
+            'direction_accuracy_1d': test_metrics['direction_accuracy_1d'],
+            'direction_accuracy_7d': test_metrics['direction_accuracy_7d']
+        }
     }
     
     import json
-    with open('model_metrics.json', 'w', encoding='utf-8') as f:
+    with open('time_split_model_metrics.json', 'w', encoding='utf-8') as f:
         json.dump(metrics_summary, f, ensure_ascii=False, indent=4)
     
-    # 可視化訓練結果
+    # 可視化訓練結果 - 使用測試集指標
     print_cyan("\n生成訓練結果可視化...")
-    visualize_training_results(train_losses, val_losses, metrics)
+    visualize_training_results(train_losses, val_losses, test_metrics)
     
-    # 預測未來股價
+    # 預測未來股價 - 使用完整數據集
     print_cyan("\n開始預測未來股價...")
-    predictions = predict_stock_future(model, metadata, device, days_ahead=7, sequences=sequences)
+    all_sequences = np.concatenate([train_sequences, test_sequences], axis=0)
+    predictions = predict_stock_future(model, full_metadata, device, days_ahead=7, sequences=all_sequences)
     
     # 打印預測摘要
     print_prediction_summary(predictions)
@@ -683,16 +849,16 @@ def train_optimized_model():
     print_cyan("\n生成預測結果可視化...")
     visualize_stock_predictions(predictions)
     
-    print_green("\n🎉 訓練和預測流程完成！")
+    print_green("\n🎉 時間分割訓練和預測流程完成！")
     print_green("📁 生成的文件:")
-    print_green("  - best_optimized_model.pth (最佳模型)")
-    print_green("  - model_metrics.json (模型評估指標)")
+    print_green("  - best_time_split_model.pth (最佳時間分割模型)")
+    print_green("  - time_split_model_metrics.json (驗證集和測試集評估指標)")
     print_green("  - predictions_summary.json (預測摘要)")
     print_green("  - comprehensive_training_results.png (訓練結果)")
     print_green("  - stock_future_predictions.png (預測結果)")
     
-    return model, metadata, metrics, predictions
+    return model, full_metadata, val_metrics, test_metrics, predictions
 
 if __name__ == "__main__":
-    model, metadata, metrics, predictions = train_optimized_model()
-    print_green("✅ 所有流程完成！")
+    model, metadata, val_metrics, test_metrics, predictions = train_optimized_model()
+    print_green("✅ 時間分割訓練流程完成！")
