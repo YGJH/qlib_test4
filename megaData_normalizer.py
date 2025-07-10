@@ -74,7 +74,7 @@ class MegaDataNormalizer:
         output_dir = 'mega_normalized_data'
         self.clear_output_dir(output_dir)
         
-        # 只處理部分股票
+        # 獲取所有CSV文件
         csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
         print_cyan(f"總共 {len(csv_files)} 個文件，分塊處理")
         
@@ -195,7 +195,12 @@ class MegaDataNormalizer:
             # 保存最終合併的數據
             print_green("保存最終合併的數據...")
             self.save_processed_data(combined_data, output_dir, timestamp)
-            
+            for chunk_file in os.listdir(output_dir):
+                if chunk_file.startswith('chunk_'):
+                    chunk_path = os.path.join(output_dir, chunk_file)
+                    os.remove(chunk_path)
+
+
             print_green(f"✓ 最終數據統計:")
             print_green(f"  總訓練序列: {final_train_sequences.shape}")
             print_green(f"  總測試序列: {final_test_sequences.shape}")
@@ -824,64 +829,6 @@ class MegaDataNormalizer:
             traceback.print_exc()
             raise
 
-    def _normalize_data_batch(self, data):
-        """批量標準化數據 - 簡化版本"""
-        print_cyan("開始批量標準化...")
-        
-        train_sequences = data['train_sequences']
-        train_targets = data['train_targets']
-        test_sequences = data['test_sequences']
-        test_targets = data['test_targets']
-        
-        batch_size = 50  # 進一步減少批量大小
-        
-        # 第一步：使用極少量數據擬合標準化器
-        print_cyan("使用極少量數據擬合標準化器...")
-        sample_size = min(100, len(train_sequences))  # 只使用100個樣本
-        sample_indices = np.random.choice(len(train_sequences), sample_size, replace=False)
-        
-        sample_sequences = train_sequences[sample_indices]
-        sample_targets = train_targets[sample_indices]
-        
-        # 擬合標準化器
-        sample_sequences_flat = sample_sequences.reshape(-1, sample_sequences.shape[-1])
-        sample_targets_flat = sample_targets.reshape(-1, 1)
-        
-        self.feature_scaler.fit(sample_sequences_flat)
-        self.target_scaler.fit(sample_targets_flat)
-        
-        del sample_sequences, sample_targets, sample_sequences_flat, sample_targets_flat
-        gc.collect()
-        
-        print_green("✓ 標準化器擬合完成")
-        
-        # 第二步：批量標準化
-        print_cyan("批量標準化訓練數據...")
-        train_sequences_normalized = self._batch_normalize_sequences(train_sequences, batch_size)
-        train_targets_normalized = self._batch_normalize_targets(train_targets, batch_size)
-        
-        if len(test_sequences) > 0:
-            print_cyan("批量標準化測試數據...")
-            test_sequences_normalized = self._batch_normalize_sequences(test_sequences, batch_size)
-            test_targets_normalized = self._batch_normalize_targets(test_targets, batch_size)
-        else:
-            test_sequences_normalized = np.array([])
-            test_targets_normalized = np.array([])
-        
-        print_green("✓ 批量標準化完成")
-        
-        return {
-            'train_sequences_normalized': train_sequences_normalized,
-            'train_targets_normalized': train_targets_normalized,
-            'test_sequences_normalized': test_sequences_normalized,
-            'test_targets_normalized': test_targets_normalized,
-            'train_metadata': data['train_metadata'],
-            'test_metadata': data['test_metadata'],
-            'feature_cols': data['feature_cols'],
-            'stock_to_id': data['stock_to_id'],
-            'test_start_date': data['test_start_date'],
-            'prediction_steps': data['prediction_steps']
-        }
 
     def _batch_normalize_sequences(self, sequences, batch_size):
         """批量標準化序列數據"""
