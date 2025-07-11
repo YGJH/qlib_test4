@@ -1,932 +1,395 @@
+#!/usr/bin/env python3
+"""
+Future Stock Price Prediction
+Generate sequences for future prediction based on stock symbol and datetime
+"""
+
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from torch.cuda.amp import autocast, GradScaler
 import numpy as np
-import pickle
-import matplotlib.pyplot as plt
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-import glob
-import re
+from colors import *
 import os
+import pickle
+import glob
 from datetime import datetime, timedelta
 import warnings
-from colors import *
-import gc
 
 warnings.filterwarnings('ignore')
 
-from stock_transformer import StockTransformer
+class FuturePredictionGenerator:
+    """Generate sequences for future price prediction"""
 
+    def __init__(self):
+        self.metadata = None
+        self.feature_scaler = None
+        self.target_scaler = None
+        self.feature_cols = None
+        self.stock_to_id = {}
+        self.sequence_length = 60
+        self.prediction_steps = 480  # Default prediction steps
 
+    def load_metadata(self, data_dir='time_normalized_data'):
+        """Load metadata from processed data"""
+        try:
+            # Find latest metadata file
+            metadata_files = glob.glob(os.path.join(data_dir, 'metadata_*.pkl'))
+            if not metadata_files:
+                raise FileNotFoundError("No metadata file found")
 
-def load_time_normalized_data():
-    """Load time-normalized data - compatible with main.py"""
-    data_dir = 'time_normalized_data'
-    
-    # Find latest files
-    train_seq_files = glob.glob(os.path.join(data_dir, 'train_sequences_*.npy'))
-    if not train_seq_files:
-        raise FileNotFoundError("No time-normalized training data found")
-    
-    latest_train_file = max(train_seq_files, key=os.path.getctime)
-    timestamp_match = re.search(r'_(\d{8}_\d{6})\.npy', latest_train_file)
-    timestamp = timestamp_match.group(1)
-    
-    # Load all data
-    train_sequences = np.load(os.path.join(data_dir, f'train_sequences_{timestamp}.npy'))
-    train_targets = np.load(os.path.join(data_dir, f'train_targets_{timestamp}.npy'))
-    
-    # Check if test data exists
-    test_seq_file = os.path.join(data_dir, f'test_sequences_{timestamp}.npy')
-    test_tar_file = os.path.join(data_dir, f'test_targets_{timestamp}.npy')
-    
-    if os.path.exists(test_seq_file) and os.path.exists(test_tar_file):
-        test_sequences = np.load(test_seq_file)
-        test_targets = np.load(test_tar_file)
-    else:
-        print_yellow("No test data found, creating empty arrays")
-        test_sequences = np.array([])
-        test_targets = np.array([])
-    
-    # Load metadata
-    with open(os.path.join(data_dir, f'metadata_{timestamp}.pkl'), 'rb') as f:
-        metadata = pickle.load(f)
-    
-    print_green(f"Loaded time-normalized data:")
-    print_green(f"  Training: {train_sequences.shape}")
-    print_green(f"  Test: {test_sequences.shape}")
-    print_green(f"  Test period: {metadata.get('test_start_date', 'N/A')}")
-    
-    # Create metadata objects for train and test
-    train_metadata = metadata['train_metadata']
-    test_metadata = metadata['test_metadata']
-    
-    return {
-        'train_sequences': train_sequences,
-        'test_sequences': test_sequences,
-        'train_targets': train_targets,
-        'test_targets': test_targets,
-        'train_metadata': train_metadata,
-        'test_metadata': test_metadata,
-        'full_metadata': metadata
-    }
+            latest_metadata_file = max(metadata_files, key=os.path.getctime)
 
+            with open(latest_metadata_file, 'rb') as f:
+                self.metadata = pickle.load(f)
 
-def time_based_split(sequences, targets, metadata, test_days=6):
-    """基於時間的數據分割"""
-    print_cyan(f"\n按時間分割數據，測試期: 最新 {test_days} 天")
-    
-    # 提取所有時間戳
-    all_datetimes = []
-    for i, item in enumerate(metadata['metadata']):
-        datetime_val = item['datetime']
-        if isinstance(datetime_val, str):
-            datetime_val = pd.to_datetime(datetime_val)
-        all_datetimes.append((i, datetime_val))
-    
-    # 按時間排序
-    all_datetimes.sort(key=lambda x: x[1])
-    
-    # 找出所有唯一的日期
-    unique_dates = sorted(list(set([dt.date() for _, dt in all_datetimes])))
-    print_cyan(f"數據時間範圍: {unique_dates[0]} 到 {unique_dates[-1]}")
-    print_cyan(f"總共 {len(unique_dates)} 天的數據")
-    
-    # 確定測試期開始日期
-    if len(unique_dates) <= test_days:
-        print_yellow(f"警告: 總天數 {len(unique_dates)} 小於等於測試天數 {test_days}")
-        test_start_date = unique_dates[len(unique_dates)//2]  # 使用後一半作為測試
-        print_yellow(f"調整測試開始日期為: {test_start_date}")
-    else:
-        test_start_date = unique_dates[-test_days]
-    
-    print_cyan(f"測試期開始日期: {test_start_date}")
-    print_cyan(f"訓練期: {unique_dates[0]} 到 {test_start_date - timedelta(days=1)}")
-    print_cyan(f"測試期: {test_start_date} 到 {unique_dates[-1]}")
-    
-    # 分割索引
-    train_indices = []
-    test_indices = []
-    
-    for i, datetime_val in all_datetimes:
-        if datetime_val.date() < test_start_date:
-            train_indices.append(i)
-        else:
-            test_indices.append(i)
-    
-    print_cyan(f"訓練樣本數: {len(train_indices)}")
-    print_cyan(f"測試樣本數: {len(test_indices)}")
-    
-    if len(test_indices) == 0:
-        raise ValueError("測試集為空，請調整 test_days 參數")
-    
-    # 分割數據
-    train_sequences = sequences[train_indices]
-    test_sequences = sequences[test_indices]
-    train_targets = targets[train_indices]
-    test_targets = targets[test_indices]
-    
-    # 分割元數據
-    train_metadata = [metadata['metadata'][i] for i in train_indices]
-    test_metadata = [metadata['metadata'][i] for i in test_indices]
-    
-    # 檢查各股票在訓練集和測試集的分佈
-    train_stocks = set([item['stock_symbol'] for item in train_metadata])
-    test_stocks = set([item['stock_symbol'] for item in test_metadata])
-    
-    print_cyan(f"\n股票分佈:")
-    print_cyan(f"  訓練集股票數: {len(train_stocks)}")
-    print_cyan(f"  測試集股票數: {len(test_stocks)}")
-    print_cyan(f"  共同股票數: {len(train_stocks & test_stocks)}")
-    
-    if len(train_stocks & test_stocks) == 0:
-        print_red("警告: 訓練集和測試集沒有共同股票！")
-    
-    return train_sequences, test_sequences, train_targets, test_targets, train_metadata, test_metadata
+            self.feature_scaler = self.metadata['feature_scaler']
+            self.target_scaler = self.metadata['target_scaler']
+            self.feature_cols = self.metadata['feature_cols']
+            self.stock_to_id = self.metadata['stock_to_id']
 
-def create_validation_split(train_sequences, train_targets, train_metadata, val_ratio=0.2):
-    """從訓練數據中創建驗證集 - 時間感知"""
-    # 確保序列數量與元數據匹配
-    min_length = min(len(train_sequences), len(train_targets), len(train_metadata))
-    
-    if min_length != len(train_sequences):
-        print_yellow(f"警告: 序列數量不匹配，調整為 {min_length}")
-        train_sequences = train_sequences[:min_length]
-        train_targets = train_targets[:min_length]
-        train_metadata = train_metadata[:min_length]
-    
-    # 按時間排序
-    sorted_indices = sorted(range(len(train_metadata)), key=lambda i: train_metadata[i]['datetime'])
-    
-    # 取最後val_ratio的數據作為驗證集
-    val_start_idx = int(len(sorted_indices) * (1 - val_ratio))
-    
-    # 分割索引
-    train_indices = sorted_indices[:val_start_idx]
-    val_indices = sorted_indices[val_start_idx:]
-    
-    # 創建分割
-    train_seq_split = train_sequences[train_indices]
-    train_tar_split = train_targets[train_indices]
-    val_seq_split = train_sequences[val_indices]
-    val_tar_split = train_targets[val_indices]
-    
-    print_cyan(f"驗證集分割:")
-    print_cyan(f"  總序列數: {len(train_sequences)}")
-    print_cyan(f"  訓練: {len(train_indices)} 個序列")
-    print_cyan(f"  驗證: {len(val_indices)} 個序列")
-    
-    return train_seq_split, train_tar_split, val_seq_split, val_tar_split
+            print_green(f"✓ Loaded metadata from {latest_metadata_file}")
+            print_cyan(f"  Available stocks: {len(self.stock_to_id)}")
+            print_cyan(f"  Feature columns: {len(self.feature_cols)}")
 
-def evaluate_model(model, data_loader, target_scaler, device, period_name=""):
-    """評估模型性能"""
-    model.eval()
-    predictions = []
-    actuals = []
-    
-    with torch.no_grad():
-        for batch_features, batch_targets, batch_stock_ids in data_loader:
-            batch_features = batch_features.to(device, non_blocking=True)
-            batch_targets = batch_targets.to(device, non_blocking=True)
-            batch_stock_ids = batch_stock_ids.squeeze().to(device, non_blocking=True)
-            
-            outputs = model(batch_features, batch_stock_ids)
-            pred = outputs['predictions'].cpu().numpy()
-            actual = batch_targets.cpu().numpy()
-            
-            predictions.append(pred)
-            actuals.append(actual)
-    
-    predictions = np.concatenate(predictions, axis=0)
-    actuals = np.concatenate(actuals, axis=0)
-    
-    # 反標準化
-    pred_flat = predictions.reshape(-1, 1)
-    actual_flat = actuals.reshape(-1, 1)
-    
-    pred_denorm = target_scaler.inverse_transform(pred_flat).reshape(predictions.shape)
-    actual_denorm = target_scaler.inverse_transform(actual_flat).reshape(actuals.shape)
-    
-    # 限制數值範圍
-    pred_denorm = np.clip(pred_denorm, -1.0, 1.0)
-    actual_denorm = np.clip(actual_denorm, -1.0, 1.0)
-    
-    # 計算指標
-    mse = mean_squared_error(actual_denorm.flatten(), pred_denorm.flatten())
-    mae = mean_absolute_error(actual_denorm.flatten(), pred_denorm.flatten())
-    rmse = np.sqrt(mse)
-    
-    # 安全的MAPE計算
-    actual_abs = np.abs(actual_denorm)
-    mask = actual_abs > 1e-6
-    if mask.sum() > 0:
-        mape = np.mean(np.abs((actual_denorm[mask] - pred_denorm[mask]) / actual_denorm[mask])) * 100
-        mape = min(mape, 1000.0)
-    else:
-        mape = 0.0
-    
-    # 方向準確率 - 不同時間點
-    direction_accuracies = {}
-    time_points = [47, 95, 143, 191, 239, 287, -1]  # 1天, 2天, 3天, 4天, 5天, 6天, 7天
-    time_labels = ['1天', '2天', '3天', '4天', '5天', '6天', '7天']
-    
-    for i, (tp, label) in enumerate(zip(time_points, time_labels)):
-        if tp == -1:
-            tp = pred_denorm.shape[1] - 1
-        
-        if tp < pred_denorm.shape[1]:
-            pred_dir = (pred_denorm[:, tp] > 0).astype(int)
-            actual_dir = (actual_denorm[:, tp] > 0).astype(int)
-            direction_accuracies[label] = (pred_dir == actual_dir).mean()
-    
-    return {
-        'mse': float(mse),
-        'mae': float(mae),
-        'rmse': float(rmse),
-        'mape': float(mape),
-        'direction_accuracies': direction_accuracies,
-        'predictions': pred_denorm,
-        'actuals': actual_denorm,
-        'period': period_name
-    }
+            return True
 
+        except Exception as e:
+            print_red(f"Error loading metadata: {e}")
+            return False
 
-def predict_stock_future(model, metadata, device, days_ahead=7, sequences=None):
-    """預測股票未來價格"""
-    model.eval()
-    
-    stock_to_id = metadata['stock_to_id']
-    target_scaler = metadata['target_scaler']
-    train_metadata = metadata.get('train_metadata', [])
-    
-    predictions = {}
-    
-    print_cyan(f"\n預測未來 {days_ahead} 天的股價變化...")
-    
-    # 如果沒有提供序列，創建一個簡單的預測
-    if sequences is None or len(sequences) == 0 or len(train_metadata) == 0:
-        print_yellow("沒有足夠的數據進行預測，返回空結果")
-        return predictions
-    
-    with torch.no_grad():
-        for stock_symbol, stock_id in stock_to_id.items():
-            print_cyan(f"預測股票: {stock_symbol}")
-            
-            try:
-                # 獲取該股票的最新序列
-                stock_sequences = []
-                stock_metadata = []
-                
-                for i, meta in enumerate(train_metadata):
-                    if i < len(sequences) and meta['stock_id'] == stock_id:
-                        stock_sequences.append(sequences[i])
-                        stock_metadata.append(meta)
-                
-                if not stock_sequences:
-                    continue
-                
-                # 使用最新的序列
-                latest_sequence = stock_sequences[-1]
-                latest_meta = stock_metadata[-1]
-                
-                # 轉換為tensor
-                input_tensor = torch.FloatTensor(latest_sequence).unsqueeze(0).to(device)
-                stock_id_tensor = torch.LongTensor([stock_id]).to(device)
-                
-                # 預測
-                outputs = model(input_tensor, stock_id_tensor)
-                predicted_changes = outputs['predictions'].cpu().numpy()[0]
-                
-                # 反標準化
-                predicted_changes_denorm = target_scaler.inverse_transform(
-                    predicted_changes.reshape(-1, 1)
-                ).flatten()
-                
-                # 限制變化範圍
-                predicted_changes_denorm = np.clip(predicted_changes_denorm, -0.1, 0.1)
-                
-                # 計算未來價格
-                current_price = latest_meta.get('current_price', 100.0)  # 默認價格
-                future_prices = []
-                current_price_temp = current_price
-                
-                for i, change in enumerate(predicted_changes_denorm):
-                    new_price = current_price_temp * (1 + change * 0.05)
-                    new_price = max(new_price, current_price * 0.7)
-                    new_price = min(new_price, current_price * 1.5)
-                    future_prices.append(new_price)
-                    current_price_temp = new_price
-                
-                # 關鍵統計
-                price_1d = future_prices[47] if len(future_prices) > 47 else future_prices[-1]
-                price_7d = future_prices[-1]
-                
-                change_1d = ((price_1d - current_price) / current_price) * 100
-                change_7d = ((price_7d - current_price) / current_price) * 100
-                
-                change_1d = np.clip(change_1d, -20, 20)
-                change_7d = np.clip(change_7d, -30, 30)
-                
-                # 波動率
-                if len(future_prices) >= 24:
-                    price_returns = []
-                    for i in range(1, min(24, len(future_prices))):
-                        ret = (future_prices[i] - future_prices[i-1]) / future_prices[i-1]
-                        price_returns.append(ret)
-                    volatility = np.std(price_returns) * 100 * np.sqrt(24)
-                    volatility = min(volatility, 50.0)
-                else:
-                    volatility = 5.0
-                
-                predictions[stock_symbol] = {
-                    'current_price': float(current_price),
-                    'price_1d': float(price_1d),
-                    'price_7d': float(price_7d),
-                    'change_1d': float(change_1d),
-                    'change_7d': float(change_7d),
-                    'volatility': float(volatility),
-                    'trend': 'bullish' if change_7d > 1 else 'bearish' if change_7d < -1 else 'neutral'
-                }
-                
-            except Exception as e:
-                print_red(f"預測股票 {stock_symbol} 時出錯: {e}")
-                continue
-    
-    return predictions
+    def load_latest_stock_data(self, stock_symbol, data_dir='data/feature'):
+        """Load the latest data for a specific stock"""
+        try:
+            stock_file = os.path.join(data_dir, f'{stock_symbol.lower()}.csv')
 
+            if not os.path.exists(stock_file):
+                print_red(f"Stock data file not found: {stock_file}")
+                return None
 
-def visualize_stock_predictions(predictions, num_stocks=6):
-    """可視化股票預測結果"""
-    from pathlib import Path 
-    font_path = Path(__file__).parent / "ttc" / "GenKiGothic2JP-B-03.ttf"
-    if font_path.exists():
-        from matplotlib import font_manager
-        font_manager.fontManager.addfont(str(font_path))
-        prop = font_manager.FontProperties(fname=str(font_path))
-        plt.rcParams["font.family"] = [prop.get_name()]
+            df = pd.read_csv(stock_file)
+            df['stock_symbol'] = stock_symbol.lower()
+            df['Datetime'] = pd.to_datetime(df['Datetime'])
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    axes = axes.flatten()
-    if num_stocks == None:
-        stocks_to_plot = list(predictions.keys())
-    else:
-        stocks_to_plot = list(predictions.keys())[:num_stocks]
+            # Apply same feature engineering as in training
+            df = self._create_robust_features(df)
+            df = self._clean_data(df)
 
-    for i, stock in enumerate(stocks_to_plot):
-        if i >= len(axes):
-            break
-        
-        pred_data = predictions[stock]
-        
-        # 繪製7天價格預測
-        days_to_show = min(7, len(pred_data['future_times']) // 48)
-        end_idx = days_to_show * 48
-        
-        times = pred_data['future_times'][:end_idx]
-        prices = pred_data['future_prices'][:end_idx]
-        
-        axes[i].plot(times, prices, linewidth=2, label='預測價格')
-        
-        # 添加當前價格線
-        axes[i].axhline(y=pred_data['current_price'], color='red', linestyle='--', alpha=0.7,
-                       label=f'當前: ${pred_data["current_price"]:.2f}')
-        
-        # 添加1天和7天預測點
-        if len(times) > 48:
-            axes[i].scatter(times[47], pred_data['price_1d'], color='orange', s=50, 
-                           label=f'1天後: ${pred_data["price_1d"]:.2f} ({pred_data["change_1d"]:+.1f}%)')
-        
-        axes[i].scatter(times[-1], pred_data['price_7d'], color='green', s=50,
-                       label=f'7天後: ${pred_data["price_7d"]:.2f} ({pred_data["change_7d"]:+.1f}%)')
-        
-        axes[i].set_title(f'{stock} - {pred_data["trend"].upper()} (波動率: {pred_data["volatility"]:.1f}%)')
-        axes[i].set_xlabel('時間')
-        axes[i].set_ylabel('價格 ($)')
-        axes[i].legend(fontsize=8)
-        axes[i].tick_params(axis='x', rotation=45)
-        axes[i].grid(True, alpha=0.3)
-    
-    # 移除多餘的子圖
-    for i in range(len(stocks_to_plot), len(axes)):
-        fig.delaxes(axes[i])
-    
-    plt.suptitle('股票未來7天價格預測', fontsize=16)
-    plt.tight_layout()
-    plt.savefig('stock_future_predictions.png', dpi=300, bbox_inches='tight')
-    plt.show()
+            # Sort by datetime
+            df = df.sort_values('Datetime').reset_index(drop=True)
 
-def print_prediction_summary(predictions):
-    """打印預測摘要 - 修復極端數值"""
-    print_green("\n" + "="*80)
-    print_green("📈 股票預測摘要報告")
-    print_green("="*80)
-    
-    # 統計分析
-    changes_1d = [pred['change_1d'] for pred in predictions.values()]
-    changes_7d = [pred['change_7d'] for pred in predictions.values()]
-    volatilities = [pred['volatility'] for pred in predictions.values()]
-    
-    print_cyan(f"\n整體市場預測:")
-    print_cyan(f"  平均1天變化: {np.mean(changes_1d):+.2f}% (標準差: {np.std(changes_1d):.2f}%)")
-    print_cyan(f"  平均7天變化: {np.mean(changes_7d):+.2f}% (標準差: {np.std(changes_7d):.2f}%)")
-    print_cyan(f"  平均波動率: {np.mean(volatilities):.2f}%")
-    
-    # 按趨勢分類
-    bullish = [s for s, p in predictions.items() if p['trend'] == 'bullish']
-    bearish = [s for s, p in predictions.items() if p['trend'] == 'bearish']
-    neutral = [s for s, p in predictions.items() if p['trend'] == 'neutral']
-    
-    print_cyan(f"\n趨勢分布:")
-    print_green(f"  看漲 (>+2%): {len(bullish)} 支股票")
-    print_red(f"  看跌 (<-2%): {len(bearish)} 支股票")
-    print_yellow(f"  中性 (-2%~+2%): {len(neutral)} 支股票")
-    
-    # 詳細預測 - 只保存關鍵信息
-    print_cyan(f"\n詳細預測結果:")
-    sorted_predictions = sorted(predictions.items(), key=lambda x: x[1]['change_7d'], reverse=True)
-    result = dict()
-    
-    for stock, pred in sorted_predictions:
-        result[stock] = {
-            'current_price': pred['current_price'],
-            'price_1d': pred['price_1d'],
-            'change_1d': pred['change_1d'],
-            'price_7d': pred['price_7d'],
-            'change_7d': pred['change_7d'],
-            'volatility': pred['volatility'],
-            'trend': pred['trend']
-        }
-    
-    # 保存預測摘要
-    import json
-    with open('predictions_summary.json', 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=4)
+            print_green(f"✓ Loaded {len(df)} records for {stock_symbol}")
+            print_cyan(f"  Date range: {df['Datetime'].min()} to {df['Datetime'].max()}")
 
-def train_optimized_model():
-    """訓練優化後的模型 - 使用時間分割"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print_green(f"使用設備: {device}")
-    
-    # 載入按時間分割的數據
-    data_dict = load_time_normalized_data()
-    
-    train_sequences = data_dict['train_sequences']
-    test_sequences = data_dict['test_sequences']
-    train_targets = data_dict['train_targets']
-    test_targets = data_dict['test_targets']
-    train_metadata = data_dict['train_metadata']
-    test_metadata = data_dict['test_metadata']
-    full_metadata = data_dict['full_metadata']
-    
-    # 提取元數據
-    stock_to_id = full_metadata['stock_to_id']
-    feature_scaler = full_metadata['feature_scaler']
-    target_scaler = full_metadata['target_scaler']
-    feature_cols = full_metadata['feature_cols']
-    
-    # 創建股票ID數組
-    train_stock_ids = np.array([item['stock_id'] for item in train_metadata])
-    test_stock_ids = np.array([item['stock_id'] for item in test_metadata])
-    
-    print_cyan(f"\n時間分割後的數據統計:")
-    print_cyan(f"  訓練序列數量: {len(train_sequences)}")
-    print_cyan(f"  測試序列數量: {len(test_sequences)}")
-    print_cyan(f"  特徵維度: {train_sequences.shape[-1]}")
-    print_cyan(f"  預測步數: {train_targets.shape[-1]}")
-    print_cyan(f"  股票數量: {len(stock_to_id)}")
-    
-    # 進一步分割訓練集為訓練/驗證 (80/20)
-    # train_seq, val_seq, train_tar, val_tar, train_ids, val_ids = train_test_split(
-    #     train_sequences, train_targets, train_stock_ids, 
-    #     test_size=0.2, random_state=42, stratify=train_stock_ids
-    # )
+            return df
 
-    from sklearn.model_selection import GroupShuffleSplit
+        except Exception as e:
+            print_red(f"Error loading stock data for {stock_symbol}: {e}")
+            return None
 
-    gss = GroupShuffleSplit(test_size=0.2, random_state=42)
-    # 這裡 groups=train_stock_ids，確保同一 group (股票) 不會被分到不同集
-    train_idx, val_idx = next(gss.split(train_sequences, train_targets, groups=train_stock_ids))
+    def _create_robust_features(self, df):
+        """Create robust features (same as megaData_normalizer.py)"""
+        df_processed = df.copy()
 
-    train_seq, val_seq = train_sequences[train_idx], train_sequences[val_idx]
-    train_tar, val_tar = train_targets[train_idx],   train_targets[val_idx]
-    train_ids,  val_ids  = train_stock_ids[train_idx], train_stock_ids[val_idx]
+        # Time features
+        df_processed['Hour'] = df_processed['Datetime'].dt.hour
+        df_processed['DayOfWeek'] = df_processed['Datetime'].dt.dayofweek
+        df_processed['Month'] = df_processed['Datetime'].dt.month
 
-    
-    print_cyan(f"\n最終數據分割:")
-    print_cyan(f"  訓練集: {len(train_seq)} 個序列")
-    print_cyan(f"  驗證集: {len(val_seq)} 個序列")
-    print_cyan(f"  測試集: {len(test_sequences)} 個序列")
-    
-    # 創建數據加載器
-    train_dataset = TensorDataset(
-        torch.FloatTensor(train_seq),
-        torch.FloatTensor(train_tar),
-        torch.LongTensor(train_ids)
-    )
-    val_dataset = TensorDataset(
-        torch.FloatTensor(val_seq),
-        torch.FloatTensor(val_tar),
-        torch.LongTensor(val_ids)
-    )
-    test_dataset = TensorDataset(
-        torch.FloatTensor(test_sequences),
-        torch.FloatTensor(test_targets),
-        torch.LongTensor(test_stock_ids)
-    )
-    
-    # 優化的數據加載器
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=64,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=64, 
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
-    )
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=64, 
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
-    )
+        # Cyclical encoding
+        df_processed['Hour_sin'] = np.sin(2 * np.pi * df_processed['Hour'] / 24)
+        df_processed['Hour_cos'] = np.cos(2 * np.pi * df_processed['Hour'] / 24)
+        df_processed['DayOfWeek_sin'] = np.sin(2 * np.pi * df_processed['DayOfWeek'] / 7)
+        df_processed['DayOfWeek_cos'] = np.cos(2 * np.pi * df_processed['DayOfWeek'] / 7)
+        df_processed['Month_sin'] = np.sin(2 * np.pi * df_processed['Month'] / 12)
+        df_processed['Month_cos'] = np.cos(2 * np.pi * df_processed['Month'] / 12)
 
-    # 創建優化的模型
-    model = StockTransformer(
-        input_dim=train_sequences.shape[-1],
-        num_stocks=len(stock_to_id),
-        d_model=256,
-        nhead=8,
-        num_layers=24,  # 減少層數
-        dropout=0.1,
-        prediction_horizon=train_targets.shape[-1]
-    ).to(device)
-    
-    # 編譯模型
-    if hasattr(torch, 'compile'):
-        model = torch.compile(model)
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    print_magenta(f"模型參數總數: {total_params/1e6:.1f}M")
-
-    # 優化的訓練設置
-    criterion = FocalMSELoss(alpha=1.0)
-    optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=1e-4, 
-        weight_decay=1e-4,
-        betas=(0.9, 0.999)
-    )
-    torch.cuda.empty_cache()
-    import gc
-    gc.collect()
-
-    # 使用預熱學習率調度
-    num_epochs = 100
-    warmup_epochs = 10
-    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs, num_epochs, 1e-4, 1e-6)
-    
-    # 混合精度訓練
-    scaler = torch.amp.GradScaler()
-    
-    # 訓練循環
-    train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
-    patience = 20
-    patience_counter = 0
-    
-    print_green(f"\n開始訓練 (共 {num_epochs} 個epoch)...")
-    
-    for epoch in range(num_epochs):
-        # 更新學習率
-        current_lr = scheduler.step(epoch)
-        
-        train_sequences = data['train_sequences']
-        train_targets = data['train_targets']
-        test_sequences = data['test_sequences']
-        test_targets = data['test_targets']
-        metadata = data['metadata']
-        
-        # 提取元數據
-        stock_to_id = metadata['stock_to_id']
-        target_scaler = metadata['target_scaler']
-        train_metadata = metadata['train_metadata']
-        test_metadata = metadata['test_metadata']
-        
-        # 創建驗證集
-        train_seq_split, train_tar_split, val_seq_split, val_tar_split = create_validation_split(
-            train_sequences, train_targets, train_metadata
+        # Price features
+        df_processed['Price_Range'] = df_processed['High'] - df_processed['Low']
+        df_processed['Price_Range_Pct'] = self._safe_division(
+            df_processed['Price_Range'], df_processed['Close'], 0.0
         )
-        
-        # 創建股票ID數組
-        train_stock_ids = np.array([meta['stock_id'] for meta in train_metadata])
-        train_ids_split = train_stock_ids[:len(train_seq_split)]
-        val_ids_split = train_stock_ids[len(train_seq_split):]
-        
-        # 創建數據加載器
-        train_dataset = TensorDataset(
-            torch.FloatTensor(train_seq_split),
-            torch.FloatTensor(train_tar_split),
-            torch.LongTensor(train_ids_split)
+        df_processed['Open_Close_Ratio'] = self._safe_division(
+            df_processed['Open'], df_processed['Close'], 1.0
         )
-        val_dataset = TensorDataset(
-            torch.FloatTensor(val_seq_split),
-            torch.FloatTensor(val_tar_split),
-            torch.LongTensor(val_ids_split)
+        df_processed['High_Close_Ratio'] = self._safe_division(
+            df_processed['High'], df_processed['Close'], 1.0
         )
-        
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, 
-                                  num_workers=8, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False,
-                                 num_workers=8, pin_memory=True)
+        df_processed['Low_Close_Ratio'] = self._safe_division(
+            df_processed['Low'], df_processed['Close'], 1.0
+        )
 
-        # 創建測試數據加載器
-        test_loader = None
-        if len(test_sequences) > 0:
-            test_stock_ids = np.array([meta['stock_id'] for meta in test_metadata])
-            test_dataset = TensorDataset(
-                torch.FloatTensor(test_sequences),
-                torch.FloatTensor(test_targets),
-                torch.LongTensor(test_stock_ids)
+        # Volume features
+        if 'Volume' in df_processed.columns:
+            df_processed['Volume'] = np.maximum(df_processed['Volume'], 0)
+            df_processed['Volume_Log'] = np.log1p(df_processed['Volume'])
+            df_processed['Volume_MA5'] = df_processed['Volume'].rolling(window=5, min_periods=1).mean()
+            df_processed['Volume_Ratio'] = self._safe_division(
+                df_processed['Volume'], df_processed['Volume_MA5'], 1.0
             )
-            test_loader = DataLoader(test_dataset, batch_size=32, 
-                            shuffle=False, num_workers=0, pin_memory=True)
-        
-        # 創建模型
-        model = StockTransformer(
-            input_dim=train_sequences.shape[-1],
-            num_stocks=len(stock_to_id),
-            d_model=256,
-            nhead=8,
-            num_layers=32,
-            dropout=0.1,
-            prediction_horizon=train_targets.shape[-1]
-        ).to(device)
-        
-        total_params = sum(p.numel() for p in model.parameters())
-        print_magenta(f"模型參數總數: {total_params/1e6:.1f}M")
-        
-        # 訓練設置
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=1e-4)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
-        
-        # 訓練循環
-        num_epochs = 2
-        train_losses = []
-        val_losses = []
-        best_val_loss = float('inf')
-        patience = 15
-        patience_counter = 0
-        
-        print_green(f"\n開始時間感知訓練 (共 {num_epochs} 個epoch)...")
-        
-        for epoch in range(num_epochs):
-            # 訓練階段
-            model.train()
-            train_loss = 0
-            for batch_features, batch_targets, batch_stock_ids in train_loader:
-                batch_features = batch_features.to(device)
-                batch_targets = batch_targets.to(device)
-                batch_stock_ids = batch_stock_ids.squeeze().to(device)
-                
-                optimizer.zero_grad()
-                outputs = model(batch_features, batch_stock_ids)
-                loss = criterion(outputs['predictions'], batch_targets)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                
-                train_loss += loss.item()
-            
-            # 驗證階段
-            model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                for batch_features, batch_targets, batch_stock_ids in val_loader:
-                    batch_features = batch_features.to(device)
-                    batch_targets = batch_targets.to(device)
-                    batch_stock_ids = batch_stock_ids.squeeze().to(device)
-                    
-                    outputs = model(batch_features, batch_stock_ids)
-                    loss = criterion(outputs['predictions'], batch_targets)
-                    val_loss += loss.item()
-            
-            avg_train_loss = train_loss / len(train_loader)
-            avg_val_loss = val_loss / len(val_loader)
-            
-            train_losses.append(avg_train_loss)
-            val_losses.append(avg_val_loss)
-            
-            scheduler.step(avg_val_loss)
-            
-            # 保存最佳模型
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'full_metadata': full_metadata,
-                'train_metadata': train_metadata,
-                'test_metadata': test_metadata,
-                'epoch': epoch,
-                'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss,
-                'optimizer_state_dict': optimizer.state_dict(),
-            }, 'best_time_split_model.pth')
-        else:
-            patience_counter += 1
-        
-        # 載入最佳模型
-        checkpoint = torch.load('best_time_aware_model.pth', weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # 評估模型
-        print_magenta("\n=== 模型評估 ===")
-        
-        # 驗證集評估
-        print_cyan("\n1. 驗證集評估:")
-        val_metrics = evaluate_model(model, val_loader, target_scaler, device, "驗證集")
-        
-        print_blue(f"  RMSE: {val_metrics['rmse']:.4f}")
-        print_blue(f"  MAE: {val_metrics['mae']:.4f}")
-        print_blue(f"  MAPE: {val_metrics['mape']:.2f}%")
-        print_blue("  方向準確率:")
-        for period, acc in val_metrics['direction_accuracies'].items():
-            print_blue(f"    {period}: {acc:.4f}")
-        
-        # 測試集評估
-        test_metrics = None
-        if test_loader is not None:
-            print_cyan("\n2. 測試集評估 (未來3天數據):")
-            test_metrics = evaluate_model(model, test_loader, target_scaler, device, "測試集")
-            
-            print_blue(f"  RMSE: {test_metrics['rmse']:.4f}")
-            print_blue(f"  MAE: {test_metrics['mae']:.4f}")
-            print_blue(f"  MAPE: {test_metrics['mape']:.2f}%")
-            print_blue("  方向準確率:")
-            for period, acc in test_metrics['direction_accuracies'].items():
-                print_blue(f"    {period}: {acc:.4f}")
-        
-        # 保存評估結果
-        results = {
-            'validation_metrics': {
-                'rmse': val_metrics['rmse'],
-                'mae': val_metrics['mae'],
-                'mape': val_metrics['mape'],
-                'direction_accuracies': val_metrics['direction_accuracies']
-            }
-        }
-        
-        if test_metrics:
-            results['test_metrics'] = {
-                'rmse': test_metrics['rmse'],
-                'mae': test_metrics['mae'],
-                'mape': test_metrics['mape'],
-                'direction_accuracies': test_metrics['direction_accuracies']
-            }
-        
-        # 保存結果
-        
-        print_green("\n🎉 時間感知模型訓練完成！")
-        print_green("📁 生成的文件:")
-        print_green("  - best_time_aware_model.pth")
-        print_green("  - time_aware_model_results.json")
-        
-        # 分析結果
-        print_cyan("\n=== 結果分析 ===")
-        if test_metrics:
-            print_cyan("驗證集 vs 測試集比較:")
-            print_cyan(f"  RMSE: 驗證集 {val_metrics['rmse']:.4f} vs 測試集 {test_metrics['rmse']:.4f}")
-            print_cyan(f"  1天方向準確率: 驗證集 {val_metrics['direction_accuracies']['1天']:.4f} vs 測試集 {test_metrics['direction_accuracies']['1天']:.4f}")
-            print_cyan(f"  7天方向準確率: 驗證集 {val_metrics['direction_accuracies']['7天']:.4f} vs 測試集 {test_metrics['direction_accuracies']['7天']:.4f}")
-        with open('model_metrics.txt', 'w', encoding='utf-8') as f:
-            f.write("=== 模型評估指標 ===\n")
-            f.write(f"RMSE: {val_metrics['rmse']:.4f}\n")
-            f.write(f"MAE: {val_metrics['mae']:.4f}\n")
-            f.write(f"MAPE: {val_metrics['mape']:.2f}%\n")
-            f.write("方向準確率:\n")
-            for period, acc in val_metrics['direction_accuracies'].items():
-                f.write(f"  {period}: {acc:.4f}\n")
 
-        # 預測未來股價
-        print_cyan("開始預測未來股價...")
-        # 使用驗證集的最後一部分數據進行預測
-        predictions = predict_stock_future(model, metadata, device, days_ahead=7, sequences=val_seq_split)
-        
-        # 保存預測結果
-        predictions_summary = {}
-        for stock, pred in predictions.items():
-            predictions_summary[stock] = {
-                'current_price': pred['current_price'],
-                'price_1d': pred['price_1d'],
-                'change_1d': pred['change_1d'],
-                'price_7d': pred['price_7d'],
-                'change_7d': pred['change_7d'],
-                'volatility': pred['volatility'],
-                'trend': pred['trend']
-            }
-        import json
-        with open('predictions_summary.json', 'w', encoding='utf-8') as f:
-            json.dump(predictions_summary, f, ensure_ascii=False, indent=4)
-        
-        print_green("\n🎉 訓練和預測完成！")
-        print_green("📁 生成的文件:")
-        print_green("  - best_robust_model.pth")
-        print_green("  - model_metrics.json")
-        print_green("  - predictions_summary.json")
-    
-    # 刪除不用的記憶體
-    del train_loader, optimizer, scheduler, scaler, model
-    torch.cuda.empty_cache()
-    import gc
-    gc.collect()
+        # Technical indicators
+        if 'RSI' in df_processed.columns:
+            df_processed['RSI'] = np.clip(df_processed['RSI'], 0, 100)
+            df_processed['RSI_Normalized'] = df_processed['RSI'] / 100.0
+            df_processed['RSI_Overbought'] = (df_processed['RSI'] > 70).astype(float)
+            df_processed['RSI_Oversold'] = (df_processed['RSI'] < 30).astype(float)
 
-    # 載入最佳模型進行評估
-    checkpoint = torch.load('best_time_split_model.pth', weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    # 評估模型在驗證集和測試集上的性能
-    print_magenta("\n評估模型性能...")
-    
-    # 驗證集評估
-    val_metrics = evaluate_model(model, val_loader, target_scaler, device)
-    print_blue(f"\n驗證集性能:")
-    print_blue(f"  RMSE: {val_metrics['rmse']:.4f}")
-    print_blue(f"  MAE: {val_metrics['mae']:.4f}")
-    print_blue(f"  MAPE: {val_metrics['mape']:.2f}%")
-    print_blue(f"  1天方向準確率: {val_metrics['direction_accuracy_1d']:.4f}")
-    print_blue(f"  7天方向準確率: {val_metrics['direction_accuracy_7d']:.4f}")
-    
-    # 測試集評估 (真正的未見過數據)
-    test_metrics = evaluate_model(model, test_loader, target_scaler, device)
-    print_green(f"\n測試集性能 (未見過的最新6天數據):")
-    print_green(f"  RMSE: {test_metrics['rmse']:.4f}")
-    print_green(f"  MAE: {test_metrics['mae']:.4f}")
-    print_green(f"  MAPE: {test_metrics['mape']:.2f}%")
-    print_green(f"  1天方向準確率: {test_metrics['direction_accuracy_1d']:.4f}")
-    print_green(f"  7天方向準確率: {test_metrics['direction_accuracy_7d']:.4f}")
-    
-    # 保存評估指標
-    metrics_summary = {
-        'validation': {
-            'rmse': val_metrics['rmse'],
-            'mae': val_metrics['mae'],
-            'mape': val_metrics['mape'],
-            'direction_accuracy_1d': val_metrics['direction_accuracy_1d'],
-            'direction_accuracy_7d': val_metrics['direction_accuracy_7d']
-        },
-        'test': {
-            'rmse': test_metrics['rmse'],
-            'mae': test_metrics['mae'],
-            'mape': test_metrics['mape'],
-            'direction_accuracy_1d': test_metrics['direction_accuracy_1d'],
-            'direction_accuracy_7d': test_metrics['direction_accuracy_7d']
-        }
-    }
-    
-    import json
-    with open('time_split_model_metrics.json', 'w', encoding='utf-8') as f:
-        json.dump(metrics_summary, f, ensure_ascii=False, indent=4)
-    
-    # 可視化訓練結果 - 使用測試集指標
-    print_cyan("\n生成訓練結果可視化...")
-    visualize_training_results(train_losses, val_losses, test_metrics)
-    
-    # 預測未來股價 - 使用完整數據集
-    print_cyan("\n開始預測未來股價...")
-    all_sequences = np.concatenate([train_sequences, test_sequences], axis=0)
-    predictions = predict_stock_future(model, full_metadata, device, days_ahead=7, sequences=all_sequences)
-    
-    # 打印預測摘要
-    print_prediction_summary(predictions)
-    
-    # 可視化預測結果
-    print_cyan("\n生成預測結果可視化...")
-    visualize_stock_predictions(predictions)
-    
-    print_green("\n🎉 時間分割訓練和預測流程完成！")
-    print_green("📁 生成的文件:")
-    print_green("  - best_time_split_model.pth (最佳時間分割模型)")
-    print_green("  - time_split_model_metrics.json (驗證集和測試集評估指標)")
-    print_green("  - predictions_summary.json (預測摘要)")
-    print_green("  - comprehensive_training_results.png (訓練結果)")
-    print_green("  - stock_future_predictions.png (預測結果)")
-    
-    return model, full_metadata, val_metrics, test_metrics, predictions
+        # MACD features
+        if 'MACD' in df_processed.columns:
+            df_processed['MACD_Signal_Diff'] = df_processed['MACD'] - df_processed.get('MACD_Signal', 0)
+            df_processed['MACD_Positive'] = (df_processed['MACD'] > 0).astype(float)
+
+        # Moving average features
+        ma_cols = [col for col in df_processed.columns if col.startswith('MA')]
+        for ma_col in ma_cols:
+            if ma_col in df_processed.columns:
+                ratio_col = f'{ma_col}_Price_Ratio'
+                df_processed[ratio_col] = self._safe_division(
+                    df_processed['Close'], df_processed[ma_col], 1.0
+                )
+
+        # Volatility features
+        df_processed['Returns'] = df_processed['Close'].pct_change().fillna(0)
+        df_processed['Returns_Abs'] = np.abs(df_processed['Returns'])
+        df_processed['Volatility_5'] = df_processed['Returns'].rolling(window=5, min_periods=1).std().fillna(0)
+
+        return df_processed
+
+    def _safe_division(self, numerator, denominator, fill_value=0.0):
+        """Safe division to avoid NaN"""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = numerator / denominator
+            result = np.where(np.isfinite(result), result, fill_value)
+            return result
+
+    def _clean_data(self, df):
+        """Clean data thoroughly"""
+        df_clean = df.copy()
+
+        # Handle numeric columns
+        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+
+        for col in numeric_cols:
+            # Replace infinite values
+            df_clean[col] = np.where(np.isinf(df_clean[col]), np.nan, df_clean[col])
+
+            # Handle extreme outliers
+            if df_clean[col].notna().sum() > 0:
+                q_low = df_clean[col].quantile(0.001)
+                q_high = df_clean[col].quantile(0.999)
+                df_clean[col] = np.clip(df_clean[col], q_low, q_high)
+
+        # Fill NaN values
+        for col in numeric_cols:
+            if df_clean[col].isnull().sum() > 0:
+                median_val = df_clean[col].median()
+                if pd.isna(median_val):
+                    median_val = 0.0
+                df_clean[col] = df_clean[col].fillna(median_val)
+
+        # Final check
+        remaining_nans = df_clean.isnull().sum().sum()
+        if remaining_nans > 0:
+            print_red(f"Warning: {remaining_nans} NaN values remaining, replacing with 0")
+            df_clean = df_clean.fillna(0.0)
+
+        return df_clean
+
+    def generate_future_sequence(self, stock_symbol, target_datetime, data_dir='data/feature'):
+        """Generate sequence for future prediction"""
+        print_green(f"Generating future sequence for {stock_symbol} at {target_datetime}")
+
+        # Load stock data
+        stock_data = self.load_latest_stock_data(stock_symbol, data_dir)
+        if stock_data is None:
+            return None
+
+        # Convert target datetime
+        target_dt = pd.to_datetime(target_datetime)
+
+        # Find the closest available data point before target datetime
+        available_data = stock_data[stock_data['Datetime'] <= target_dt]
+
+        if len(available_data) < self.sequence_length:
+            print_red(f"Insufficient historical data. Need at least {self.sequence_length} records, got {len(available_data)}")
+            return None
+
+        # Get the most recent sequence_length records
+        recent_data = available_data.tail(self.sequence_length).copy()
+
+        # Extract features
+        try:
+            features = recent_data[self.feature_cols].values
+
+            # Normalize features using the same scaler from training
+            features_normalized = self.feature_scaler.transform(features)
+
+            # Get current price info
+            current_price = recent_data['Close'].iloc[-1]
+            current_open = recent_data['Open'].iloc[-1]
+            current_datetime = recent_data['Datetime'].iloc[-1]
+
+            # Create sequence ready for model prediction
+            sequence = features_normalized.reshape(1, self.sequence_length, -1)
+
+            prediction_info = {
+                'sequence': sequence,
+                'current_price': current_price,
+                'current_open': current_open,
+                'current_datetime': current_datetime,
+                'target_datetime': target_dt,
+                'stock_symbol': stock_symbol,
+                'stock_id': self.stock_to_id.get(stock_symbol.lower(), -1),
+                'sequence_shape': sequence.shape,
+                'feature_names': self.feature_cols
+            }
+
+            print_green(f"✓ Generated sequence successfully")
+            print_cyan(f"  Sequence shape: {sequence.shape}")
+            print_cyan(f"  Current price: ${current_price:.2f}")
+            print_cyan(f"  Current open: ${current_open:.2f}")
+            print_cyan(f"  Data as of: {current_datetime}")
+            print_cyan(f"  Predicting for: {target_dt}")
+
+            return prediction_info
+
+        except Exception as e:
+            print_red(f"Error generating sequence: {e}")
+            return None
+
+    def predict_future_prices(self, model, stock_symbol, target_datetime, data_dir='data/feature'):
+        """Complete pipeline: generate sequence and predict future prices"""
+        print_green("=" * 80)
+        print_green(f"FUTURE PRICE PREDICTION FOR {stock_symbol.upper()}")
+        print_green("=" * 80)
+
+        # Generate sequence
+        prediction_info = self.generate_future_sequence(stock_symbol, target_datetime, data_dir)
+        if prediction_info is None:
+            return None
+
+        # Make prediction
+        try:
+            print_cyan("Making prediction...")
+            normalized_predictions = model.predict(prediction_info['sequence'], verbose=0)
+
+            # Denormalize predictions
+            predictions_flat = normalized_predictions.flatten().reshape(-1, 1)
+            predictions_original = self.target_scaler.inverse_transform(predictions_flat).flatten()
+
+            # Convert relative changes to actual prices
+            current_price = prediction_info['current_price']
+            predicted_prices = current_price * (1 + predictions_original)
+
+            # Generate future timestamps (assuming 30-minute intervals)
+            future_timestamps = []
+            base_time = prediction_info['current_datetime']
+            for i in range(len(predicted_prices)):
+                future_timestamps.append(base_time + timedelta(minutes=30*(i+1)))
+
+            # Create results
+            results = {
+                'stock_symbol': stock_symbol,
+                'current_datetime': prediction_info['current_datetime'],
+                'target_datetime': prediction_info['target_datetime'],
+                'current_price': current_price,
+                'current_open': prediction_info['current_open'],
+                'predicted_prices': predicted_prices,
+                'future_timestamps': future_timestamps,
+                'prediction_changes': predictions_original,
+                'prediction_count': len(predicted_prices)
+            }
+
+            print_green(f"✓ Prediction completed successfully")
+            print_cyan(f"  Generated {len(predicted_prices)} future price predictions")
+            print_cyan(f"  Price range: ${predicted_prices.min():.2f} - ${predicted_prices.max():.2f}")
+
+            return results
+
+        except Exception as e:
+            print_red(f"Error making prediction: {e}")
+            return None
+
+    def save_predictions(self, results, output_file=None):
+        """Save predictions to file"""
+        if results is None:
+            return
+
+        if output_file is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = f"future_predictions_{results['stock_symbol']}_{timestamp}.csv"
+
+        try:
+            # Create DataFrame
+            df = pd.DataFrame({
+                'datetime': results['future_timestamps'],
+                'predicted_price': results['predicted_prices'],
+                'price_change_pct': results['prediction_changes'] * 100
+            })
+
+            df.to_csv(output_file, index=False)
+            print_green(f"✓ Predictions saved to {output_file}")
+
+        except Exception as e:
+            print_red(f"Error saving predictions: {e}")
+
+    def display_predictions(self, results):
+        """Display predictions in a formatted way"""
+        if results is None:
+            return
+
+        print_green("\n" + "=" * 80)
+        print_green("PREDICTION RESULTS")
+        print_green("=" * 80)
+
+        print_cyan(f"Stock: {results['stock_symbol'].upper()}")
+        print_cyan(f"Current Price: ${results['current_price']:.2f}")
+        print_cyan(f"Current Open: ${results['current_open']:.2f}")
+        print_cyan(f"Data as of: {results['current_datetime']}")
+        print_cyan(f"Predicting for: {results['target_datetime']}")
+
+        print_green(f"\nFirst 10 Future Price Predictions:")
+        for i in range(min(10, len(results['predicted_prices']))):
+            timestamp = results['future_timestamps'][i]
+            price = results['predicted_prices'][i]
+            change_pct = results['prediction_changes'][i] * 100
+
+            color_func = print_green if change_pct >= 0 else print_red
+            color_func(f"  {timestamp}: ${price:.2f} ({change_pct:+.2f}%)")
+
+        if len(results['predicted_prices']) > 10:
+            print_cyan(f"\n... and {len(results['predicted_prices']) - 10} more predictions")
+
+def main():
+    """Example usage"""
+    print_green("=" * 80)
+    print_green("FUTURE STOCK PRICE PREDICTION SYSTEM")
+    print_green("=" * 80)
+
+    # Initialize predictor
+    predictor = FuturePredictionGenerator()
+
+    # Load metadata
+    if not predictor.load_metadata():
+        print_red("Failed to load metadata. Make sure you have run the data processing first.")
+        return
+
+    # Example usage
+    stock_symbol = "AAPL"  # Example stock
+    target_datetime = "2025-07-11 15:30:00"  # Example target time
+
+    # Note: You would need to load your trained model here
+    # model = load_model('your_trained_model.h5')
+
+    print_yellow("Note: This is a template. You need to:")
+    print_yellow("1. Load your trained model")
+    print_yellow("2. Call predictor.predict_future_prices(model, stock_symbol, target_datetime)")
+    print_yellow("3. Use predictor.display_predictions(results) to show results")
+
+    # Show available stocks
+    print_green(f"\nAvailable stocks ({len(predictor.stock_to_id)}):")
+    for i, stock in enumerate(list(predictor.stock_to_id.keys())[:10]):
+        print_cyan(f"  {stock.upper()}")
+    if len(predictor.stock_to_id) > 10:
+        print_cyan(f"  ... and {len(predictor.stock_to_id) - 10} more")
 
 if __name__ == "__main__":
-    model, metadata, val_metrics, test_metrics, predictions = train_optimized_model()
-    print_green("✅ 時間分割訓練流程完成！")
+    main()
