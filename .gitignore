@@ -9,8 +9,10 @@ data/
 normalized_data/
 ttc/
 fixed_normalized_data/
-robust_normalized_data/
 mega_normalized_data/
+robust_normalized_data/
+financial-data-normalizer/
+time_normalized_data/
 *.json
 *.txt
 *.png
